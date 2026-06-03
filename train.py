@@ -1,4 +1,6 @@
-import argparse
+import logging
+import sys
+
 import pytorch_lightning as pl
 import torch
 from pytorch_lightning.callbacks import ModelCheckpoint
@@ -9,10 +11,13 @@ from torch.optim import lr_scheduler
 import mixvpr.utils
 # import utils
 
+from configs.parser import build_config
 from data.GSVCitiesDataloader import GSVCitiesDataModule
 # from dataloaders.GSVCitiesDataloader import GSVCitiesDataModule
 from mixvpr.models import helper
 # from models import helper
+
+logger = logging.getLogger(__name__)
 
 
 class VPRModel(pl.LightningModule):
@@ -47,9 +52,11 @@ class VPRModel(pl.LightningModule):
         miner_margin=0.1,
         faiss_gpu=False,
         freeze_all=False,
+        freeze_batchnorm=False,
     ):
         super().__init__()
         self.freeze_all = freeze_all
+        self.freeze_batchnorm = freeze_batchnorm
         if freeze_all:
             self.automatic_optimization = False
         if layers_to_crop is None:
@@ -97,26 +104,28 @@ class VPRModel(pl.LightningModule):
         self.aggregator = helper.get_aggregator(agg_arch, agg_config)
 
         if self.freeze_all:
-            self._freeze_all_trainable()
+            self._freeze_base()
 
-    def _freeze_all_trainable(self):
-        """Freeze backbone + aggregator; keep BN in eval mode (no stat updates)."""
-        for param in self.parameters():
-            param.requires_grad = False
-        for module in self.modules():
-            if isinstance(module, torch.nn.BatchNorm2d):
-                module.eval()
-                module.track_running_stats = False
+    def _freeze_base(self):
+        """Freeze backbone + aggregator weights only."""
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+        for p in self.aggregator.parameters():
+            p.requires_grad = False
+
+    def on_train_epoch_start(self):
+        self.train()
+        if self.freeze_batchnorm:
+            for m in self.modules():
+                if isinstance(m, torch.nn.BatchNorm2d):
+                    m.eval()
+            logger.info("BatchNorm2d layers frozen (freeze_batchnorm)")
 
     # the forward pass of the lightning model
     def forward(self, x):
         x = self.backbone(x)
         x = self.aggregator(x)
         return x
-
-    def on_train_epoch_start(self):
-        if self.freeze_all:
-            self.eval()
 
     # configure the optimizer
     def configure_optimizers(self):
@@ -149,11 +158,9 @@ class VPRModel(pl.LightningModule):
         return [optim], [scheduler]
 
     # configure the optizer step, takes into account the warmup stage
-    def optimizer_step(
-        self, epoch, batch_idx, optimizer, optimizer_idx, optimizer_closure,
-        on_tpu=False, using_native_amp=False, using_lbfgs=False,
-    ):
-        # warm up lr
+    # Lightning 2.x passes optimizer_closure as the 4th arg (no optimizer_idx / on_tpu kwargs).
+    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure=None):
+        del epoch, batch_idx
         if self.trainer.global_step < self.warmpup_steps:
             lr_scale = min(1.0, float(self.trainer.global_step + 1) / self.warmpup_steps)
             for pg in optimizer.param_groups:
@@ -195,8 +202,6 @@ class VPRModel(pl.LightningModule):
 
     # This is the training step that's executed at each iteration
     def training_step(self, batch, batch_idx):
-        if self.freeze_all:
-            self.eval()
         places, labels = batch
 
         # Note that GSVCities yields places (each containing N images)
@@ -216,28 +221,35 @@ class VPRModel(pl.LightningModule):
             return None
         return {"loss": loss}
 
-    # This is called at the end of eatch training epoch
-    def training_epoch_end(self, training_step_outputs):
-        # we empty the batch_acc list for next epoch
+    # Lightning 2.x: replaces training_epoch_end (removed in PL2).
+    def on_train_epoch_end(self):
         self.batch_acc = []
+
+    # Lightning 2.x: validation_epoch_end removed; accumulate step outputs for on_validation_epoch_end.
+    def on_validation_epoch_start(self):
+        self._val_feats_by_dl = {}
 
     # For validation, we will also iterate step by step over the validation set
     # this is the way Pytorch Lghtning is made. All about modularity, folks.
-    def validation_step(self, batch, batch_idx, dataloader_idx=None):
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
         images, _ = batch
         # places, _ = batch
         # calculate descriptors
         descriptors = self(images)
         # descriptors = self(places)
-        return descriptors.detach().cpu()
+        out = descriptors.detach().cpu()
+        # Lightning 2.x: collect descriptors here (see on_validation_epoch_end).
+        dl_idx = 0 if dataloader_idx is None else int(dataloader_idx)
+        self._val_feats_by_dl.setdefault(dl_idx, []).append(out)
+        return out
 
-    def validation_epoch_end(self, val_step_outputs):
-        """this return descriptors in their order
-        depending on how the validation dataset is implemented
-        for this project (MSLS val, Pittburg val), it is always references then queries
-        [R1, R2, ..., Rn, Q1, Q2, ...]
-        """
+    # Lightning 2.x: replaces validation_epoch_end (removed in PL2).
+    def on_validation_epoch_end(self):
+        """Descriptors ordered refs then queries per val set (MSLS / Pitts)."""
         dm = self.trainer.datamodule
+        val_step_outputs = [
+            self._val_feats_by_dl.get(i, []) for i in range(len(dm.val_datasets))
+        ]
         # The following line is a hack: if we have only one validation set, then
         # we need to put the outputs in a list (Pytorch Lightning does not do it presently)
         if len(dm.val_datasets) == 1:  # we need to put the outputs in a list
@@ -309,7 +321,8 @@ def _print_recall_comparison(before: dict, after: dict) -> None:
 
 
 def _load_checkpoint_weights(model: VPRModel, ckpt_path: str) -> None:
-    checkpoint = torch.load(ckpt_path, map_location="cpu")
+    # PyTorch 2.x (Lightning 2 stack): allow full checkpoint load, not weights-only tensors.
+    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     state_dict = checkpoint.get("state_dict", checkpoint)
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing:
@@ -318,22 +331,15 @@ def _load_checkpoint_weights(model: VPRModel, ckpt_path: str) -> None:
         print(f"Checkpoint load: {len(unexpected)} unexpected keys (first 5): {unexpected[:5]}")
 
 
-def parse_train_args():
-    p = argparse.ArgumentParser(description="MixVPR Lightning training (train_mixvpr.py)")
-    p.add_argument("--freeze_model", action="store_true", help="Freeze backbone+aggregator; sanity-check recalls")
-    p.add_argument("--max_epochs", type=int, default=80)
-    p.add_argument("--validate_before_fit", action="store_true",
-                   help="Run validation once before training (for frozen recall check)")
-    p.add_argument("--resume_ckpt", type=str, default=None, help="Optional Lightning .ckpt to load before train/val")
-    p.add_argument("--gpu", type=int, default=0, help="CUDA device index")
-    p.add_argument("--num_workers", type=int, default=28)
-    p.add_argument("--no_checkpoint", action="store_true", help="Disable ModelCheckpoint callback")
-    return p.parse_args()
-
-
 if __name__ == "__main__":
-    args = parse_train_args()
-    pl.utilities.seed.seed_everything(seed=190223, workers=True)
+    cfg, _entries = build_config()
+    logger.info(" ".join(sys.argv))
+    if cfg.get("log_dir"):
+        logger.info("The outputs are being saved in %s", cfg["log_dir"])
+
+    # Lightning 2.x: pl.seed_everything (replaces pl.utilities.seed.seed_everything).
+    seed = cfg["seed"] if cfg["seed"] != -1 else 190223
+    pl.seed_everything(seed=seed, workers=True)
 
     datamodule = GSVCitiesDataModule(
         batch_size=120,
@@ -342,12 +348,12 @@ if __name__ == "__main__":
         shuffle_all=False,  # shuffle all images or keep shuffling in-city only
         random_sample_from_each_place=True,
         image_size=(320, 320),
-        num_workers=args.num_workers,
+        num_workers=cfg["num_workers"],
         show_data_stats=True,
         val_set_names=["pitts30k_val", "pitts30k_test", "msls_val"],  # pitts30k_val, pitts30k_test, msls_val
         # Repo-specific: val paths from configs/datasets.json (not MixVPR .mat layout)
-        datasets_config="configs/datasets.json",
-        positive_dist_threshold=25,
+        datasets_config=cfg["config"],
+        positive_dist_threshold=cfg["positive_dist_threshold"],
     )
 
     # examples of backbones
@@ -400,14 +406,15 @@ if __name__ == "__main__":
         miner_name="MultiSimilarityMiner",  # example: TripletMarginMiner, MultiSimilarityMiner, PairMarginMiner
         miner_margin=0.1,
         faiss_gpu=False,
-        freeze_all=args.freeze_model,
+        freeze_all=cfg["freeze_model"],
+        freeze_batchnorm=cfg.get("freeze_batchnorm", False),
     )
 
-    if args.resume_ckpt:
-        _load_checkpoint_weights(model, args.resume_ckpt)
+    if cfg.get("resume_ckpt"):
+        _load_checkpoint_weights(model, cfg["resume_ckpt"])
 
     callbacks = []
-    if not args.no_checkpoint:
+    if not cfg.get("no_checkpoint"):
         callbacks.append(
             ModelCheckpoint(
                 monitor="pitts30k_val/R1",
@@ -424,14 +431,14 @@ if __name__ == "__main__":
 
     # ------------------
     # we instanciate a trainer
+    use_gpu = cfg["device"] == "cuda"
     trainer = pl.Trainer(
-        accelerator="gpu",
-        devices=[args.gpu],
+        accelerator="gpu" if use_gpu else "cpu",
+        devices=1 if use_gpu else "auto",
         default_root_dir=f"./LOGS/{model.encoder_arch}",  # Tensorflow can be used to viz
-
         num_sanity_val_steps=0,  # runs a validation step before stating training
-        precision=16,  # we use half precision to reduce  memory usage
-        max_epochs=args.max_epochs,
+        precision="16-mixed",  # Lightning 2.x mixed precision (was precision=16 in PL1).
+        max_epochs=cfg["epochs_num"],
         check_val_every_n_epoch=1,  # run validation every epoch
         callbacks=callbacks,
         reload_dataloaders_every_n_epochs=1,  # we reload the dataset to shuffle the order
@@ -441,13 +448,13 @@ if __name__ == "__main__":
 
     datamodule.setup("fit")
     recalls_before = None
-    if args.validate_before_fit or args.freeze_model:
+    if cfg.get("validate_before_fit") or cfg.get("freeze_model"):
         print("\n>>> Validation BEFORE training\n")
         trainer.validate(model=model, datamodule=datamodule)
         recalls_before = _collect_recall_metrics(trainer)
 
     trainer.fit(model=model, datamodule=datamodule)
 
-    if args.freeze_model and recalls_before is not None:
+    if cfg.get("freeze_model") and recalls_before is not None:
         recalls_after = _collect_recall_metrics(trainer)
         _print_recall_comparison(recalls_before, recalls_after)

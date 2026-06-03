@@ -15,6 +15,30 @@ from utils.early_stop_utils import canonical_early_stop_metrics, recall_values_n
 logger = logging.getLogger(__name__)
 
 
+def _cuda_works() -> bool:
+    """Return True only if a small CUDA forward pass produces finite outputs."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        conv = torch.nn.Conv2d(3, 8, kernel_size=3).cuda()
+        x = torch.randn(1, 3, 32, 32, device="cuda")
+        y = conv(x)
+        return bool(torch.isfinite(y).all().item())
+    except Exception:
+        return False
+
+
+def _resolve_device(requested: str) -> str:
+    requested = str(requested or "auto").lower()
+    if requested == "cpu":
+        return "cpu"
+    if requested in ("auto", "cuda") and _cuda_works():
+        return "cuda"
+    if requested == "cuda":
+        logger.warning("CUDA requested but unavailable or incompatible with this PyTorch build; using CPU.")
+    return "cpu"
+
+
 def parse_args() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
     p = argparse.ArgumentParser(description="Config-first CLI: JSON config + CLI overrides.")
 
@@ -75,7 +99,17 @@ def parse_args() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
     p.add_argument("--log_every_n_iterations", type=int, default=1000,
         help="Log training stats every N iterations within each epoch (rolling mean over last N); 0 disables.")
     p.add_argument("--losses", type=str, default="ce", help="Losses to use, comma-separated (e.g. 'ce', 'ce,uncertainty')")
-    p.add_argument("--freeze_model", action="store_true", help="Freeze backbone/aggregation, train only the uncertainty head")
+    p.add_argument(
+        "--freeze_model",
+        action="store_true",
+        help="Freeze backbone/aggregation; train var_head only (uncertainty) or sanity-check recalls (MixVPR).",
+    )
+    p.add_argument("--validate_before_fit", action="store_true",
+                   help="Run validation once before training (for frozen recall sanity checks)")
+    # MixVPR Lightning training (train.py)
+    p.add_argument("--resume_ckpt", type=str, default=None,
+                   help="MixVPR train: optional Lightning .ckpt to load before train/val")
+    p.add_argument("--no_checkpoint", action="store_true", help="MixVPR train: disable ModelCheckpoint callback")
     p.add_argument("--freeze_batchnorm",  action="store_true",
         help="Freeze BatchNorm layers (set to eval mode) during training to keep running stats fixed.")
     p.add_argument("--patience", type=int, default=15, help="Patience for early stopping (epochs without improvement)")
@@ -214,7 +248,7 @@ def normalize(merged: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(merged)
 
     # Paths: store as strings in config, but normalize to expanded string paths
-    for k in ("data_folder", "logs_folder", "resume_train", "resume_model"):
+    for k in ("data_folder", "logs_folder", "resume_train", "resume_model", "resume_ckpt"):
         if k in out and out[k] is not None:
             out[k] = str(Path(out[k]).expanduser())
 
@@ -281,9 +315,9 @@ def normalize(merged: Dict[str, Any]) -> Dict[str, Any]:
     out["var_head_linear"] = str(out.get("var_head_linear", "d")).lower()
     out["ece_two_sided"] = bool(out.get("ece_two_sided", False))
 
-    # Device auto-detection
-    requested_device = str(out.get("device", "auto")).lower()
-    out["device"] = "cuda" if requested_device in ("auto", "cuda") and torch.cuda.is_available() else "cpu"
+    out["device"] = _resolve_device(out.get("device", "auto"))
+    if out["device"] == "cpu" and str(out.get("device", "auto")).lower() in ("auto", "cuda"):
+        logger.info("Using device: cpu (GPU unavailable or incompatible with installed PyTorch).")
 
     return out
 
@@ -390,6 +424,7 @@ def build_config():
     cfg = load_config(cfg_path)
     merged = merge_cfg_with_cli(cfg, args, parser)
     merged = normalize(merged)
+    merged["config"] = str(cfg_path.expanduser())
 
     log_dir = setup_logging(merged.get("logs_folder"),
                             dry_run=merged.get("dry_run", False),

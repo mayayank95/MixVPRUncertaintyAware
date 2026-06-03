@@ -3,7 +3,22 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
-import wandb
+
+
+def _import_wandb():
+    """Import wandb on demand so eval/train can run without it when --use_wandb is off."""
+    import wandb
+
+    return wandb
+
+
+def _require_wandb():
+    try:
+        return _import_wandb()
+    except ImportError as exc:
+        raise ImportError(
+            "wandb is required when --use_wandb is set. Install with: pip install wandb"
+        ) from exc
 
 
 def _normalize_losses_for_name(losses: Any) -> list:
@@ -101,6 +116,7 @@ def init_wandb(args: Dict[str, Any], job_type: str = "train") -> bool:
     """Initialize Weights & Biases run if use_wandb is enabled. Returns True if initialized."""
     if not args.get("use_wandb"):
         return False
+    wandb = _require_wandb()
     run_name = args.get("wandb_run_name") or _default_wandb_run_name(args, job_type)
     if isinstance(run_name, Path):
         run_name = run_name.name
@@ -115,6 +131,10 @@ def init_wandb(args: Dict[str, Any], job_type: str = "train") -> bool:
 
 def log_wandb(metrics: Dict[str, Any], step: Optional[int] = None) -> None:
     """Log metrics to W&B if a run is active. No-op otherwise."""
+    try:
+        wandb = _import_wandb()
+    except ImportError:
+        return
     if wandb.run is not None:
         wandb.log(metrics, step=step)
 
@@ -126,6 +146,10 @@ def update_wandb_summary(metrics: Dict[str, Any]) -> None:
     runs table and the run's Summary sidebar, but should NOT produce a
     single-point line chart in the workspace. No-op if no run is active.
     """
+    try:
+        wandb = _import_wandb()
+    except ImportError:
+        return
     if wandb.run is None or not metrics:
         return
     for k, v in metrics.items():
@@ -134,6 +158,10 @@ def update_wandb_summary(metrics: Dict[str, Any]) -> None:
 
 def save_wandb_logs(log_dir: Optional[str]) -> None:
     """Upload debug.log and info.log from log_dir to the current W&B run. Call before wandb.finish()."""
+    try:
+        wandb = _import_wandb()
+    except ImportError:
+        return
     if wandb.run is None or not log_dir:
         return
     log_path = Path(log_dir)
@@ -371,7 +399,11 @@ def log_eval_results(
     media_metrics.update(build_eval_summary_html_panels(cfg, all_panel_data, combined_outputs))
     log_payload = {**panel_payload, **media_metrics}
     if log_payload:
-        if wandb.run is not None:
+        try:
+            wandb = _import_wandb()
+        except ImportError:
+            wandb = None
+        if wandb is not None and wandb.run is not None:
             for key, value in panel_payload.items():
                 if key.endswith("/table"):
                     wandb.run.summary[key] = value
@@ -578,8 +610,7 @@ def finish_run(cfg: Dict[str, Any]) -> None:
     if not cfg.get("use_wandb"):
         return
     save_wandb_logs(cfg.get("log_dir"))
-    import wandb
-    wandb.finish()
+    _require_wandb().finish()
 
 
 def finish_train_run(cfg: Dict[str, Any]) -> None:

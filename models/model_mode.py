@@ -5,8 +5,7 @@ import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
 
-from models.cosplace_uncertainty.cosplace_model.cosplace_network import GeoLocalizationNet
-from models.cosplace_uncertainty.cosplace_model.layers import L2Norm
+from models.layers import L2Norm
 from models.mixvpr import MixVPRModel, mixvpr_agg_config
 
 
@@ -64,21 +63,6 @@ def _build_var_head(opt, fc_output_dim, aggregation=None):
     return head, use_agg
 
 
-class CosPlaceEncoder(GeoLocalizationNet):
-    """CosPlace method encoder: backbone + aggregation."""
-
-    def __init__(self, opt):
-        super().__init__(
-            backbone=opt.get("backbone", "ResNet18"),
-            fc_output_dim=opt.get("descriptors_dimension", 512),
-            train_all_layers=opt.get("train_all_layers", False),
-        )
-
-    @property
-    def aggregation_module(self):
-        return self.aggregation
-
-
 class MixVPREncoder(MixVPRModel):
     """MixVPR method encoder: backbone + aggregator (flatten in MixVPR.forward)."""
 
@@ -91,8 +75,6 @@ class MixVPREncoder(MixVPRModel):
 
 
 _METHOD_ENCODERS = {
-    "cosplace": CosPlaceEncoder,
-    "cosplace_pretrained": CosPlaceEncoder,
     "mixvpr": MixVPREncoder,
 }
 

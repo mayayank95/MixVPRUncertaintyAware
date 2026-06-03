@@ -1,7 +1,5 @@
 # https://github.com/amaralibey/gsv-cities
 
-import os
-
 import pandas as pd
 from pathlib import Path
 from PIL import Image
@@ -14,9 +12,12 @@ default_transform = T.Compose([
     T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
-# Override with GSV_CITIES_PATH or pass base_path= to GSVCitiesDataset
-DEFAULT_BASE_PATH = os.environ.get("GSV_CITIES_PATH", "datasets/gsv_cities/")
-BASE_PATH = DEFAULT_BASE_PATH
+# NOTE: Hard coded path to dataset folder 
+BASE_PATH = "/home/shared/datasets/gsv_cities/" # '../datasets/gsv_cities/'
+
+if not Path(BASE_PATH).exists():
+    raise FileNotFoundError(
+        'BASE_PATH is hardcoded, please adjust to point to gsv_cities')
 
 class GSVCitiesDataset(Dataset):
     def __init__(self,
@@ -25,15 +26,10 @@ class GSVCitiesDataset(Dataset):
                  min_img_per_place=4,
                  random_sample_from_each_place=True,
                  transform=default_transform,
-                 base_path=None
+                 base_path=BASE_PATH
                  ):
         super(GSVCitiesDataset, self).__init__()
-        self.base_path = base_path or BASE_PATH
-        if not Path(self.base_path).exists():
-            raise FileNotFoundError(
-                f"GSV-Cities not found at {self.base_path}. "
-                "Set GSV_CITIES_PATH or pass base_path= to GSVCitiesDataset."
-            )
+        self.base_path = base_path
         self.cities = cities
 
         assert img_per_place <= min_img_per_place, \

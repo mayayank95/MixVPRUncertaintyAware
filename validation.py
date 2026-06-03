@@ -30,7 +30,7 @@ def get_validation_recalls(r_list, q_list, k_values, gt, print_results=True, fai
         for q_idx, pred in enumerate(predictions):
             for i, n in enumerate(k_values):
                 # if in top N then also in top NN, where NN > N
-                if np.any(np.in1d(pred[:n], gt[q_idx])):
+                if np.any(np.isin(pred[:n], gt[q_idx])):
                     correct_at_k[i:] += 1
                     break
         

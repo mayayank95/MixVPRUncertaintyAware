@@ -1,5 +1,6 @@
 .venv/
 .venv-mixvpr/
+.venv-mixvpr-blackwell/
 local_venv_alt/
 __pycache__/
 *.pyc
@@ -11,6 +12,7 @@ cache/
 *.pth
 .vscode/
 .idea/
+scripts/
 configs/datasets.json
 wandb/
 mixvpr/datasets/

@@ -246,7 +246,7 @@ def compute_baselines(
         )
 
     positive_rate = float(np.mean([
-        float(np.any(np.in1d(predictions[i][:1], positives_per_query[i])))
+        float(np.any(np.isin(predictions[i][:1], positives_per_query[i])))
         for i in range(len(predictions))
     ]))
     results["random_baseline"] = positive_rate

@@ -1,0 +1,20 @@
+{
+  "data_folder": "/path/to/datasets",
+  "logs_folder": "logs/MixVPR",
+  "datasets": "pitts30k,msls-val",
+  "entries": [
+    { "name": "pitts30k", "path": "pitts30k/images" },
+    { "name": "msls-val", "path": "msls" }
+  ],
+  "method": "mixvpr",
+  "backbone": "ResNet50",
+  "descriptors_dimension": 512,
+  "positive_dist_threshold": 25,
+  "batch_size": 32,
+  "image_size": 512,
+  "model_mode": "basic",
+  "uncertainty_loss": "vmf",
+  "datasets_type": "test",
+  "variance_activation": "softplus",
+  "patience": 15
+}

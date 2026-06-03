@@ -1,0 +1,25 @@
+# MixVPR upstream stack for train_mixvpr.py (PyTorch Lightning 1.x + torch 1.13).
+# Install PyTorch first via scripts/setup_mixvpr_venv.sh (CUDA wheel), then this file.
+#
+# Pin set from third_party/MixVPR/requirements.txt (faiss: pick ONE of cpu/gpu below).
+
+matplotlib==3.5.3
+numpy==1.23.4
+pandas==1.5.1
+Pillow==9.2.0
+prettytable==3.5.0
+pytorch-lightning==1.8.3
+pytorch-metric-learning==1.6.3
+scikit-learn==1.2.1
+scipy==1.9.3
+tensorboard==2.11.0
+timm==0.6.12
+torchmetrics==0.11.1
+tqdm==4.64.1
+
+# Use faiss-gpu if you have CUDA; otherwise comment gpu and use faiss-cpu.
+faiss-gpu==1.7.2
+# faiss-cpu==1.7.2
+
+# Lightning 1.8 still imports pkg_resources (removed from setuptools>=81).
+setuptools>=65,<81

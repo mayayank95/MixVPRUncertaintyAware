@@ -8,110 +8,49 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from torch.optim import lr_scheduler
 # from torch.optim import lr_scheduler, optimizer
 
-import mixvpr.utils
-# import utils
-
 from configs.parser import build_config
 from data.GSVCitiesDataloader import GSVCitiesDataModule
-# from dataloaders.GSVCitiesDataloader import GSVCitiesDataModule
-from mixvpr.models import helper
-# from models import helper
+from losses.losses import get_loss, get_miner
+from utils.runtime import init_model
+from validation import get_validation_recalls
 
 logger = logging.getLogger(__name__)
 
 
 class VPRModel(pl.LightningModule):
-    """This is the main model for Visual Place Recognition
-    we use Pytorch Lightning for modularity purposes.
+    """Lightning wrapper around MixVPR encoder from get_model (same path as eval)."""
 
-    Args:
-        pl (_type_): _description_
-    """
-
-    def __init__(
-        self,
-        # ---- Backbone
-        backbone_arch="resnet50",
-        pretrained=True,
-        layers_to_freeze=1,
-        layers_to_crop=None,
-        # ---- Aggregator
-        agg_arch="ConvAP",  # CosPlace, NetVLAD, GeM
-        agg_config=None,
-        # ---- Train hyperparameters
-        lr=0.03,
-        optimizer="sgd",
-        weight_decay=1e-3,
-        momentum=0.9,
-        warmpup_steps=500,
-        milestones=None,
-        lr_mult=0.3,
-        # ----- Loss
-        loss_name="MultiSimilarityLoss",
-        miner_name="MultiSimilarityMiner",
-        miner_margin=0.1,
-        faiss_gpu=False,
-        freeze_all=False,
-        freeze_batchnorm=False,
-    ):
+    def __init__(self, cfg, core: torch.nn.Module):
         super().__init__()
-        self.freeze_all = freeze_all
-        self.freeze_batchnorm = freeze_batchnorm
-        if freeze_all:
+        self.freeze_all = bool(cfg.get("freeze_model"))
+        self.freeze_batchnorm = bool(cfg.get("freeze_batchnorm"))
+        if self.freeze_all:
             self.automatic_optimization = False
-        if layers_to_crop is None:
-            layers_to_crop = []
-        if agg_config is None:
-            agg_config = {}
-        if milestones is None:
-            milestones = [5, 10, 15]
 
-        self.encoder_arch = backbone_arch
-        self.pretrained = pretrained
-        self.layers_to_freeze = layers_to_freeze
-        self.layers_to_crop = layers_to_crop
+        self.encoder_arch = cfg.get("mixvpr_encoder_arch", "resnet50")
+        self.lr = cfg["lr"]
+        self.optimizer = cfg["mixvpr_optimizer"]
+        self.weight_decay = cfg["mixvpr_weight_decay"]
+        self.momentum = cfg["mixvpr_momentum"]
+        self.warmpup_steps = cfg["mixvpr_warmup_steps"]
+        self.milestones = list(cfg["mixvpr_milestones"])
+        self.lr_mult = cfg["mixvpr_lr_mult"]
 
-        self.agg_arch = agg_arch
-        self.agg_config = agg_config
-
-        self.lr = lr
-        self.optimizer = optimizer
-        self.weight_decay = weight_decay
-        self.momentum = momentum
-        self.warmpup_steps = warmpup_steps
-        self.milestones = milestones
-        self.lr_mult = lr_mult
-
+        loss_name = cfg["mixvpr_loss_name"]
+        miner_name = cfg.get("mixvpr_miner_name") or ""
         self.loss_name = loss_name
         self.miner_name = miner_name
-        self.miner_margin = miner_margin
+        self.miner_margin = cfg["mixvpr_miner_margin"]
+        self.faiss_gpu = bool(cfg.get("mixvpr_faiss_gpu"))
 
-        self.save_hyperparameters()  # write hyperparams into a file
+        self.save_hyperparameters(ignore=["core"])
 
-        self.loss_fn = mixvpr.utils.get_loss(loss_name)
-        # self.loss_fn = utils.get_loss(loss_name)
-        self.miner = mixvpr.utils.get_miner(miner_name, miner_margin)
-        # self.miner = utils.get_miner(miner_name, miner_margin)
-        self.batch_acc = []  # we will keep track of the % of trivial pairs/triplets at the loss level
+        self.loss_fn = get_loss(loss_name)
+        self.miner = get_miner(miner_name, self.miner_margin) if miner_name else None
+        self.batch_acc = []
 
-        self.faiss_gpu = faiss_gpu
-
-        # ----------------------------------
-        # get the backbone and the aggregator
-        self.backbone = helper.get_backbone(
-            backbone_arch, pretrained, layers_to_freeze, layers_to_crop
-        )
-        self.aggregator = helper.get_aggregator(agg_arch, agg_config)
-
-        if self.freeze_all:
-            self._freeze_base()
-
-    def _freeze_base(self):
-        """Freeze backbone + aggregator weights only."""
-        for p in self.backbone.parameters():
-            p.requires_grad = False
-        for p in self.aggregator.parameters():
-            p.requires_grad = False
+        # Same descriptor path as eval.py (resize + backbone + aggregator + L2Norm).
+        self.core = core
 
     def on_train_epoch_start(self):
         self.train()
@@ -121,11 +60,9 @@ class VPRModel(pl.LightningModule):
                     m.eval()
             logger.info("BatchNorm2d layers frozen (freeze_batchnorm)")
 
-    # the forward pass of the lightning model
     def forward(self, x):
-        x = self.backbone(x)
-        x = self.aggregator(x)
-        return x
+        descriptors, _ = self.core(x)
+        return descriptors
 
     # configure the optimizer
     def configure_optimizers(self):
@@ -276,8 +213,7 @@ class VPRModel(pl.LightningModule):
 
             r_list = feats[:num_references]
             q_list = feats[num_references:]
-            pitts_dict = mixvpr.utils.get_validation_recalls(
-                # pitts_dict = utils.get_validation_recalls(
+            pitts_dict = get_validation_recalls(
                 r_list=r_list,
                 q_list=q_list,
                 k_values=[1, 5, 10, 15, 20, 50, 100],
@@ -320,17 +256,6 @@ def _print_recall_comparison(before: dict, after: dict) -> None:
     print("=" * 60 + "\n")
 
 
-def _load_checkpoint_weights(model: VPRModel, ckpt_path: str) -> None:
-    # PyTorch 2.x (Lightning 2 stack): allow full checkpoint load, not weights-only tensors.
-    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    state_dict = checkpoint.get("state_dict", checkpoint)
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    if missing:
-        print(f"Checkpoint load: {len(missing)} missing keys (first 5): {missing[:5]}")
-    if unexpected:
-        print(f"Checkpoint load: {len(unexpected)} unexpected keys (first 5): {unexpected[:5]}")
-
-
 if __name__ == "__main__":
     cfg, _entries = build_config()
     logger.info(" ".join(sys.argv))
@@ -341,90 +266,39 @@ if __name__ == "__main__":
     seed = cfg["seed"] if cfg["seed"] != -1 else 190223
     pl.seed_everything(seed=seed, workers=True)
 
+    _device, core = init_model(cfg)
+    del _device
+
+    img_side = int(cfg["image_size"])
     datamodule = GSVCitiesDataModule(
-        batch_size=120,
-        img_per_place=4,
-        min_img_per_place=4,
-        shuffle_all=False,  # shuffle all images or keep shuffling in-city only
-        random_sample_from_each_place=True,
-        image_size=(320, 320),
+        batch_size=cfg["batch_size"],
+        img_per_place=cfg["img_per_place"],
+        min_img_per_place=cfg["min_img_per_place"],
+        shuffle_all=bool(cfg["mixvpr_shuffle_all"]),
+        random_sample_from_each_place=bool(cfg["mixvpr_random_sample_from_each_place"]),
+        image_size=(img_side, img_side),
         num_workers=cfg["num_workers"],
         show_data_stats=True,
-        val_set_names=["pitts30k_val", "pitts30k_test", "msls_val"],  # pitts30k_val, pitts30k_test, msls_val
-        # Repo-specific: val paths from configs/datasets.json (not MixVPR .mat layout)
+        val_set_names=list(cfg["mixvpr_val_sets"]),
         datasets_config=cfg["config"],
         positive_dist_threshold=cfg["positive_dist_threshold"],
     )
 
-    # examples of backbones
-    # resnet18, resnet50, resnet101, resnet152,
-    # resnext50_32x4d, resnext50_32x4d_swsl , resnext101_32x4d_swsl, resnext101_32x8d_swsl
-    # efficientnet_b0, efficientnet_b1, efficientnet_b2
-    # swinv2_base_window12to16_192to256_22kft1k
-    model = VPRModel(
-        # ---- Encoder
-        backbone_arch="resnet50",
-        pretrained=True,
-        layers_to_freeze=2,
-        layers_to_crop=[4],  # 4 crops the last resnet layer, 3 crops the 3rd, ...etc
-
-        # ---- Aggregator
-        # agg_arch='CosPlace',
-        # agg_config={'in_dim': 2048,
-        #             'out_dim': 2048},
-        # agg_arch='GeM',
-        # agg_config={'p': 3},
-
-        # agg_arch='ConvAP',
-        # agg_config={'in_channels': 2048,
-        #             'out_channels': 2048},
-
-        agg_arch="MixVPR",
-        agg_config={
-            "in_channels": 1024,
-            "in_h": 20,
-            "in_w": 20,
-            "out_channels": 256,
-            "mix_depth": 4,
-            "mlp_ratio": 1,
-            "out_rows": 2,
-        },  # descriptor dim = out_rows * out_channels = 512
-
-        # ---- Train hyperparameters
-        lr=0.05,  # 0.0002 for adam, 0.05 or sgd (needs to change according to batch size)
-        optimizer="sgd",  # sgd, adamw
-        weight_decay=0.001,  # 0.001 for sgd and 0 for adam,
-        momentum=0.9,
-        warmpup_steps=650,
-        milestones=[5, 10, 15, 25, 45],
-        lr_mult=0.3,
-
-        # ----- Loss functions
-        # example: ContrastiveLoss, TripletMarginLoss, MultiSimilarityLoss,
-        # FastAPLoss, CircleLoss, SupConLoss,
-        loss_name="MultiSimilarityLoss",
-        miner_name="MultiSimilarityMiner",  # example: TripletMarginMiner, MultiSimilarityMiner, PairMarginMiner
-        miner_margin=0.1,
-        faiss_gpu=False,
-        freeze_all=cfg["freeze_model"],
-        freeze_batchnorm=cfg.get("freeze_batchnorm", False),
-    )
-
-    if cfg.get("resume_ckpt"):
-        _load_checkpoint_weights(model, cfg["resume_ckpt"])
+    model = VPRModel(cfg, core=core)
 
     callbacks = []
     if not cfg.get("no_checkpoint"):
+        ckpt_monitor = cfg["mixvpr_ckpt_monitor"]
         callbacks.append(
             ModelCheckpoint(
-                monitor="pitts30k_val/R1",
+                monitor=ckpt_monitor,
                 filename=(
                     f"{model.encoder_arch}"
-                    + "_epoch({epoch:02d})_step({step:04d})_R1[{pitts30k_val/R1:.4f}]_R5[{pitts30k_val/R5:.4f}]"
+                    + f"_epoch({{epoch:02d}})_step({{step:04d}})_R1[{{{ckpt_monitor}:.4f}}]"
                 ),
                 auto_insert_metric_name=False,
                 save_weights_only=True,
-                save_top_k=3,
+                save_top_k=cfg["mixvpr_ckpt_save_top_k"],
                 mode="max",
             )
         )
@@ -432,18 +306,19 @@ if __name__ == "__main__":
     # ------------------
     # we instanciate a trainer
     use_gpu = cfg["device"] == "cuda"
+    default_root_dir = f"./LOGS/{model.encoder_arch}"
     trainer = pl.Trainer(
         accelerator="gpu" if use_gpu else "cpu",
         devices=1 if use_gpu else "auto",
-        default_root_dir=f"./LOGS/{model.encoder_arch}",  # Tensorflow can be used to viz
-        num_sanity_val_steps=0,  # runs a validation step before stating training
-        precision="16-mixed",  # Lightning 2.x mixed precision (was precision=16 in PL1).
+        default_root_dir=default_root_dir,
+        num_sanity_val_steps=cfg["num_sanity_val_steps"],
+        precision=cfg["precision"],
         max_epochs=cfg["epochs_num"],
-        check_val_every_n_epoch=1,  # run validation every epoch
+        check_val_every_n_epoch=cfg["check_val_every_n_epoch"],
         callbacks=callbacks,
-        reload_dataloaders_every_n_epochs=1,  # we reload the dataset to shuffle the order
-        log_every_n_steps=20,
-        # fast_dev_run=True  # uncomment or dev mode (only runs a one iteration train and validation, no checkpointing).
+        reload_dataloaders_every_n_epochs=1 if cfg["reload_dataloaders"] else 0,
+        log_every_n_steps=cfg["log_every_n_steps"],
+        # fast_dev_run=True  # uncomment for one-iteration smoke test
     )
 
     datamodule.setup("fit")

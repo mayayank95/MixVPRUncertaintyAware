@@ -1,11 +1,19 @@
 import numpy as np
+import torch
 import faiss
 import faiss.contrib.torch_utils
 from prettytable import PrettyTable
 
 
+def _faiss_inputs(r_list, q_list):
+    """FAISS torch utils require float32 (Lightning 16-mixed val may output float16)."""
+    if torch.is_tensor(r_list):
+        return r_list.float().contiguous(), q_list.float().contiguous()
+    return np.asarray(r_list, dtype=np.float32), np.asarray(q_list, dtype=np.float32)
+
+
 def get_validation_recalls(r_list, q_list, k_values, gt, print_results=True, faiss_gpu=False, dataset_name='dataset without name ?'):
-        
+        r_list, q_list = _faiss_inputs(r_list, q_list)
         embed_size = r_list.shape[1]
         if faiss_gpu:
             res = faiss.StandardGpuResources()

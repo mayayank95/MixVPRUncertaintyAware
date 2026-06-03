@@ -16,7 +16,7 @@ def _load_weights(
 ):
     """Load model weights from a checkpoint file (strict=False to allow mismatches).
     If skip_var_head is True, do not load var_head keys (keep build-time init, e.g. var_init)."""
-    logger.info(f"Loading model weights from {checkpoint_path}")
+    logger.info("Loading model weights from %s", checkpoint_path)
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     state_dict = checkpoint.get(state_dict_key, checkpoint)
     if skip_var_head:
@@ -64,7 +64,6 @@ def get_model(args: Dict[str, Any]) -> torch.nn.Module:
 
     resume_path = args.get("resume_model")
     if resume_path is not None:
-        # When var_init: don't load var_head from checkpoint, then force re-init
         skip_var_head = bool(args.get("var_init"))
         state_dict_key = args.get("ckpt_state_dict_key", "model_state_dict")
         _load_weights(model, resume_path, state_dict_key=state_dict_key, skip_var_head=skip_var_head)
@@ -79,8 +78,8 @@ def get_model(args: Dict[str, Any]) -> torch.nn.Module:
 
     if args.get("freeze_model"):
         trainable = model.freeze_base()
-        if not trainable:
-            raise ValueError("--freeze_model: no trainable parameters remain. Nothing to train.")
+        # if not trainable:
+        #     raise ValueError("--freeze_model: no trainable parameters remain. Nothing to train.")
         trainable_names = [n for n, p in model.named_parameters() if p.requires_grad]
         logger.debug(f"Base model frozen, training {len(trainable)} params: {trainable_names}")
 

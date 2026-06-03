@@ -15,6 +15,3 @@ cache/
 scripts/
 configs/datasets.json
 wandb/
-mixvpr/datasets/
-mixvpr/image/
-mixvpr/.git/

@@ -75,7 +75,8 @@ def parse_args() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
 
     # Resume / checkpoint
     p.add_argument("--resume_train", type=str, default=None, help="Path to training checkpoint, e.g. logs/.../last_checkpoint.pth")
-    p.add_argument("--resume_model", type=str, default=None, help="Path to model weights, e.g. logs/.../best_model.pth")
+    p.add_argument("--resume_model", type=str, default=None,
+                   help="Path to pretrained weights (.pth, Lightning .ckpt, etc.)")
     p.add_argument("--ckpt_state_dict_key", type=str, default="model_state_dict",
         help="Key for state dict in checkpoint (default: model_state_dict, common alternatives: state_dict)")
     p.add_argument("--load_classifiers", type=str, default=None, help="Path to checkpoint to load and freeze classifier weights from")
@@ -106,12 +107,8 @@ def parse_args() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
     )
     p.add_argument("--validate_before_fit", action="store_true",
                    help="Run validation once before training (for frozen recall sanity checks)")
-    # MixVPR Lightning training (train.py)
-    p.add_argument("--resume_ckpt", type=str, default=None,
-                   help="MixVPR train: optional Lightning .ckpt to load before train/val")
-    p.add_argument("--no_checkpoint", action="store_true", help="MixVPR train: disable ModelCheckpoint callback")
-    p.add_argument("--freeze_batchnorm",  action="store_true",
-        help="Freeze BatchNorm layers (set to eval mode) during training to keep running stats fixed.")
+    p.add_argument("--freeze_batchnorm", action="store_true",
+                   help="Freeze BatchNorm layers (set to eval mode) during training to keep running stats fixed.")
     p.add_argument("--patience", type=int, default=15, help="Patience for early stopping (epochs without improvement)")
     p.add_argument("--disable_early_stop", action="store_true", help="Disable early stopping and always run all epochs")
     p.add_argument("--early_stop_metric", type=str, default="recall",
@@ -122,6 +119,66 @@ def parse_args() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
         help="Two-phase early stopping: Phase 1 tracks recall only; when recall plateaus "
         "(exhausts patience), Phase 2 activates the ECE metrics with fresh patience. "
         "Requires early_stop_metric to include both recall and at least one ece_recall_* metric.")
+
+    # MixVPR train.py
+    p.add_argument("--no_checkpoint", action="store_true", help="MixVPR train: Disable ModelCheckpoint callback")
+    p.add_argument("--img_per_place", type=int, default=4,
+                   help="GSVCities train: images sampled per place (train.py)")
+    p.add_argument("--min_img_per_place", type=int, default=4,
+                   help="GSVCities train: minimum images per place in the dataset (train.py)")
+    p.add_argument("--precision", type=str, default="16-mixed",
+                   help="Lightning Trainer precision (train.py)")
+    p.add_argument("--reload_dataloaders", action=argparse.BooleanOptionalAction, default=True,
+                   help="Reload train dataloader each epoch (train.py)")
+    p.add_argument("--log_every_n_steps", type=int, default=20,
+                   help="Lightning log_every_n_steps (train.py)")
+    p.add_argument("--num_sanity_val_steps", type=int, default=0,
+                   help="Lightning sanity validation steps before training (train.py)")
+    p.add_argument("--check_val_every_n_epoch", type=int, default=1,
+                   help="Run validation every N epochs (train.py)")
+
+    # MixVPR (train.py) — data
+    p.add_argument(
+        "--mixvpr_val_sets",
+        type=str,
+        default="pitts30k_val,pitts30k_test,msls_val",
+        help="Comma-separated GSVCities val set names (paths from --config)",
+    )
+    p.add_argument(
+        "--mixvpr_shuffle_all",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Shuffle all GSVCities images (default: within city only)",
+    )
+    p.add_argument(
+        "--mixvpr_random_sample_from_each_place",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Random image subset per place each epoch",
+    )
+
+    # MixVPR (train.py) — hyperparameters
+    p.add_argument("--mixvpr_optimizer", type=str, default="sgd", choices=["sgd", "adamw", "adam"],
+                   help="MixVPR train: optimizer")
+    p.add_argument("--mixvpr_weight_decay", type=float, default=0.001, help="MixVPR train: weight decay")
+    p.add_argument("--mixvpr_momentum", type=float, default=0.9, help="MixVPR train: SGD momentum")
+    p.add_argument("--mixvpr_warmup_steps", type=int, default=650, help="MixVPR train: LR warmup steps")
+    p.add_argument("--mixvpr_milestones", type=int, nargs="+", default=[5, 10, 15, 25, 45],
+                   help="MixVPR train: MultiStepLR milestones")
+    p.add_argument("--mixvpr_lr_mult", type=float, default=0.3, help="MixVPR train: LR decay at milestones")
+    p.add_argument("--mixvpr_loss_name", type=str, default="MultiSimilarityLoss", help="MixVPR train: metric-learning loss")
+    p.add_argument("--mixvpr_miner_name", type=str, default="MultiSimilarityMiner",
+                   help="MixVPR train: online miner (empty to disable)")
+    p.add_argument("--mixvpr_miner_margin", type=float, default=0.1, help="MixVPR train: miner margin")
+    p.add_argument("--mixvpr_faiss_gpu", action="store_true", help="Use GPU FAISS in MixVPR validation recalls")
+
+    # MixVPR (train.py) — trainer
+    p.add_argument("--mixvpr_encoder_arch", type=str, default="resnet50",
+                   help="Backbone label for Lightning logs/checkpoints")
+    p.add_argument("--mixvpr_ckpt_monitor", type=str, default="pitts30k_val/R1",
+                   help="ModelCheckpoint monitor metric")
+    p.add_argument("--mixvpr_ckpt_save_top_k", type=int, default=3, help="ModelCheckpoint save_top_k")
+
 
     # Data augmentation
     p.add_argument("--augmentation_device", type=str, default="cuda", choices=["cuda", "cpu"], help="Device for data augmentation")
@@ -248,11 +305,11 @@ def normalize(merged: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(merged)
 
     # Paths: store as strings in config, but normalize to expanded string paths
-    for k in ("data_folder", "logs_folder", "resume_train", "resume_model", "resume_ckpt"):
+    for k in ("data_folder", "logs_folder", "resume_train", "resume_model"):
         if k in out and out[k] is not None:
             out[k] = str(Path(out[k]).expanduser())
 
-    for element in ("datasets", "datasets_type", "losses"):
+    for element in ("datasets", "datasets_type", "losses", "mixvpr_val_sets"):
         if element in out and out[element] is not None:
             v = out[element]
             if isinstance(v, list):

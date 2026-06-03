@@ -1,0 +1,126 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Train MixVPR (GSV-Cities, 512-d)",
+            "type": "debugpy",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "program": "${workspaceFolder}/train_mixvpr.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "python": "${workspaceFolder}/.venv-mixvpr/bin/python",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0",
+                "GSV_CITIES_PATH": "/home/shared/datasets/gsv_cities/"
+            },
+            "args": [
+                "--max_epochs",
+                "80",
+                "--num_workers",
+                "8",
+                "--gpu",
+                "0"
+            ]
+        },
+        {
+            "name": "Train MixVPR frozen sanity (1 epoch)",
+            "type": "debugpy",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "program": "${workspaceFolder}/train_mixvpr.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "python": "${workspaceFolder}/.venv-mixvpr/bin/python",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0",
+                "GSV_CITIES_PATH": "/home/shared/datasets/gsv_cities/"
+            },
+            "args": [
+                "--freeze_model",
+                "--max_epochs",
+                "1",
+                "--validate_before_fit",
+                "--no_checkpoint",
+                "--num_workers",
+                "8",
+                "--gpu",
+                "0"
+            ]
+        },
+        {
+            "name": "Eval MixVPR pitts30k+msls-query",
+            "type": "debugpy",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "program": "${workspaceFolder}/eval.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0"
+            },
+            "args": [
+                "--config",
+                "configs/datasets.json",
+                "--datasets",
+                "pitts30k,msls-val",
+                "--datasets_type",
+                "test",
+                "--eval_query_folders",
+                "query",
+                "--method",
+                "mixvpr",
+                "--descriptors_dimension",
+                "512",
+                "--resume_model",
+                "LOGS/resnet50/lightning_logs/version_0/checkpoints/last.ckpt",
+                "--ckpt_state_dict_key",
+                "state_dict",
+                "--model_mode",
+                "basic",
+                "--use_labels",
+                "--num_workers",
+                "8",
+                "--backbone",
+                "ResNet50"
+            ]
+        },
+        {
+            "name": "Eval MixVPR (pretrained 512-d hub ckpt)",
+            "type": "debugpy",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "program": "${workspaceFolder}/eval.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0"
+            },
+            "args": [
+                "--config",
+                "configs/datasets.json",
+                "--datasets",
+                "pitts30k,msls-val",
+                "--datasets_type",
+                "test",
+                "--eval_query_folders",
+                "query",
+                "--method",
+                "mixvpr",
+                "--descriptors_dimension",
+                "512",
+                "--resume_model",
+                "logs/MixVPR/resnet50_MixVPR_512_channels(256)_rows(2).ckpt",
+                "--ckpt_state_dict_key",
+                "model_state_dict",
+                "--model_mode",
+                "basic",
+                "--use_labels",
+                "--num_workers",
+                "8",
+                "--backbone",
+                "ResNet50"
+            ]
+        }
+    ]
+}

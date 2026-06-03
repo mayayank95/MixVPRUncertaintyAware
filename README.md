@@ -1,6 +1,6 @@
-# MixVPR-Pure
+# MixVPRUncertaintyAware
 
-Standalone MixVPR training and evaluation with repo-specific dataset layout (`database/` + `queries/` via `configs/datasets.json`), forked from [UncertaintyAwareModels](https://github.com/mayayank95/UncertaintyAwareModels).
+Standalone MixVPR training and evaluation with uncertainty-aware eval tooling and repo-specific dataset layout (`database/` + `queries/` via `configs/datasets.json`), forked from [UncertaintyAwareModels](https://github.com/mayayank95/UncertaintyAwareModels).
 
 ## Layout
 
@@ -14,11 +14,14 @@ Standalone MixVPR training and evaluation with repo-specific dataset layout (`da
 
 ## Setup
 
+A copy of `.venv-mixvpr` from UncertaintyAwareModels may already exist in this repo (not tracked by git). Otherwise:
+
 ```bash
 python3.9 -m venv .venv-mixvpr
 source .venv-mixvpr/bin/activate
 pip install torch torchvision  # match your CUDA
 pip install -r requirements-mixvpr.txt
+# or: pip install -r requirements.txt  (same pins as requirements-mixvpr.txt)
 
 cp configs/datasets.json.example configs/datasets.json
 # edit data_folder and paths

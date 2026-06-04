@@ -193,10 +193,8 @@ def _log_retrieval_console(
     if not args.get("use_labels"):
         return
     if args.get("mixvpr_recall_pretty_table"):
-        from validation import MIXVPR_VAL_RECALL_K_VALUES, print_recall_pretty_table
-
-        k_values = args.get("mixvpr_recall_k_values", MIXVPR_VAL_RECALL_K_VALUES)
-        print_recall_pretty_table(recalls, k_values, dataset_name)
+        # PrettyTable printed from utils.mixvpr_eval.print_mixvpr_val_recalls (train val paths).
+        pass
     else:
         # --- old eval.py console (logger, not PrettyTable) ---
         # if args["use_labels"]:
@@ -363,6 +361,7 @@ def eval_dataset(
     Extracts features once, then computes recalls and uncertainty metrics.
     """
     was_training = model.training
+    model = model.to(device)
     model.eval()
     dataset_output_dir = Path(args["log_dir"]) / "eval" / dataset_name
     if not args["dry_run"] or args.get("use_wandb"):

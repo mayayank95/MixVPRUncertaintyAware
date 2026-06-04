@@ -11,7 +11,7 @@ from data.mixvpr_val_dataset import VAL_SET_MAP, load_val_dataset_paths
 from eval_metrics.dataset_eval import EvalDatasetResult, eval_dataset, evaluate_from_descriptors
 from eval_metrics.eval_wandb import panel_to_wandb_metrics
 from utils import wandb_utils
-from validation import MIXVPR_VAL_RECALL_K_VALUES
+from validation import MIXVPR_VAL_RECALL_K_VALUES, print_recall_pretty_table
 
 if TYPE_CHECKING:
     import pytorch_lightning as pl
@@ -22,11 +22,24 @@ logger = logging.getLogger(__name__)
 def _prepare_mixvpr_eval_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """Legacy PrettyTable recall on stdout (K=1,5,10,15,20,50,100)."""
     eval_cfg = dict(cfg)
-    eval_cfg.setdefault("use_labels", True)
+    eval_cfg["use_labels"] = True
     eval_cfg["mixvpr_recall_pretty_table"] = True
     eval_cfg["mixvpr_recall_k_values"] = MIXVPR_VAL_RECALL_K_VALUES
     eval_cfg["recall_values"] = list(MIXVPR_VAL_RECALL_K_VALUES)
     return eval_cfg
+
+
+def print_mixvpr_val_recalls(
+    val_set_name: str,
+    recalls,
+    k_values: Optional[List[int]] = None,
+) -> None:
+    """Legacy MixVPR stdout: PrettyTable ``Performances on {dataset}``."""
+    import sys
+
+    k_values = list(k_values or MIXVPR_VAL_RECALL_K_VALUES)
+    print_recall_pretty_table(recalls, k_values, val_set_name)
+    sys.stdout.flush()
 
 
 def _val_set_names(cfg: Dict[str, Any]) -> List[str]:
@@ -146,6 +159,7 @@ def run_mixvpr_validation_eval(
             base_dataset_name=entry_name,
             use_descriptor_cache=use_descriptor_cache,
         )
+        print_mixvpr_val_recalls(val_set_name, results.recalls, eval_cfg.get("recall_values"))
         metrics.update(
             log_mixvpr_eval_result(
                 results, val_set_name, eval_cfg, wandb_step=wandb_step
@@ -180,8 +194,8 @@ def run_mixvpr_lightning_val_eval(
         if not feat_batches or not var_batches:
             continue
 
-        feats = torch.concat(feat_batches, dim=0).numpy()
-        variances = torch.concat(var_batches, dim=0).numpy()
+        feats = torch.concat(feat_batches, dim=0).float().numpy()
+        variances = torch.concat(var_batches, dim=0).float().numpy()
         num_references = mixvpr_val_num_references(val_set_name, val_dataset)
 
         db_desc = feats[:num_references]
@@ -209,6 +223,7 @@ def run_mixvpr_lightning_val_eval(
             base_dataset_name=base_name,
             save_recalls=False,
         )
+        print_mixvpr_val_recalls(val_set_name, result.recalls, eval_cfg.get("recall_values"))
         log_mixvpr_eval_result(
             result,
             val_set_name,

@@ -347,22 +347,22 @@ if __name__ == "__main__":
 
     datamodule.setup("fit")
     recalls_before = None
-    # if cfg.get("validate_before_fit") or cfg.get("freeze_model"):
-    #     print("\n>>> eval.py validation BEFORE training\n")
-    #     # print("\n>>> Validation BEFORE training\n")
-    #     # trainer.validate(model=model, datamodule=datamodule)
-    #     # recalls_before = _collect_recall_metrics(trainer)
-    #     recalls_before = run_mixvpr_validation_eval(
-    #         cfg, core, device, wandb_step=0, use_descriptor_cache=False
-    #     )
+    if cfg.get("validate_before_fit") or cfg.get("freeze_model"):
+        print("\n>>> Validation BEFORE training\n")
+        # trainer.validate(model=model, datamodule=datamodule)
+        # recalls_before = _collect_recall_metrics(trainer)
+        recalls_before = run_mixvpr_validation_eval(
+            cfg, core, device, wandb_step=0, use_descriptor_cache=False
+        )
 
     model._set_train_mode()
     trainer.fit(model=model, datamodule=datamodule)
 
     if cfg.get("freeze_model") and recalls_before is not None:
-        print("\n>>> eval.py validation AFTER training\n")
+        print("\n>>> Validation AFTER training\n")
+        # Lightning may leave weights on CPU after fit; eval_dataset moves model back to device.
         recalls_after = run_mixvpr_validation_eval(
-            cfg, core, device, wandb_step=cfg.get("epochs_num", 0), use_descriptor_cache=False
+            cfg, model.core, device, wandb_step=cfg.get("epochs_num", 0), use_descriptor_cache=False
         )
         _print_recall_comparison(recalls_before, recalls_after)
 

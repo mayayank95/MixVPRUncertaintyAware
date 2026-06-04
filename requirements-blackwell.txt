@@ -1,11 +1,11 @@
 # Blackwell GPU (sm_120): PyTorch 2.7+ built with CUDA 12.8
-# Use for eval.py and train.py on RTX PRO 6000 / sm_120.
-# train.py targets this env (Lightning 2.x + PyTorch cu128).
 #
 # Setup:
 #   bash scripts/setup_venv_blackwell.sh
 #   source .venv-mixvpr-blackwell/bin/activate
-#   python eval.py ...
+#
+# Train:  python train.py --gpu 0 ...
+# Eval:   python eval.py ...   (same venv)
 
 --extra-index-url https://download.pytorch.org/whl/cu128
 torch>=2.7.0,<2.9

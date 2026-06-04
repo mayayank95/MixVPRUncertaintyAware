@@ -103,7 +103,7 @@ def parse_args() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
     p.add_argument(
         "--freeze_model",
         action="store_true",
-        help="Freeze backbone/aggregation; train var_head only (uncertainty) or sanity-check recalls (MixVPR).",
+        help="Freeze backbone/aggregator (base); train var_head/final_l2 with --head_lr. Use with --freeze_batchnorm for fixed BN stats.",
     )
     p.add_argument("--validate_before_fit", action="store_true",
                    help="Run validation once before training (for frozen recall sanity checks)")
@@ -166,7 +166,31 @@ def parse_args() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
     p.add_argument("--mixvpr_milestones", type=int, nargs="+", default=[5, 10, 15, 25, 45],
                    help="MixVPR train: MultiStepLR milestones")
     p.add_argument("--mixvpr_lr_mult", type=float, default=0.3, help="MixVPR train: LR decay at milestones")
-    p.add_argument("--mixvpr_loss_name", type=str, default="MultiSimilarityLoss", help="MixVPR train: metric-learning loss")
+    p.add_argument(
+        "--mixvpr_train_losses",
+        type=str,
+        default="basic",
+        help="MixVPR train loss branches: basic, uncertainty, or basic,uncertainty",
+    )
+    p.add_argument(
+        "--mixvpr_basic_loss_type",
+        type=str,
+        default=None,
+        help="When basic is enabled: MultiSimilarityLoss, CircleLoss, TripletMarginLoss, etc.",
+    )
+    p.add_argument(
+        "--mixvpr_uncertainty_loss_type",
+        type=str,
+        default=None,
+        help="When uncertainty is enabled: vmf, gaussian_nll, gaussian_cosine, vmf_place "
+        "(default: --uncertainty_loss)",
+    )
+    p.add_argument("--mixvpr_basic_loss_weight", type=float, default=1.0,
+                   help="Weight for basic (metric-learning) loss")
+    p.add_argument("--mixvpr_uncertainty_loss_weight", type=float, default=None,
+                   help="Weight for uncertainty loss (default: --uncertainty_lambda)")
+    p.add_argument("--mixvpr_loss_name", type=str, default="MultiSimilarityLoss",
+                   help="Alias for --mixvpr_basic_loss_type if that flag is omitted")
     p.add_argument("--mixvpr_miner_name", type=str, default="MultiSimilarityMiner",
                    help="MixVPR train: online miner (empty to disable)")
     p.add_argument("--mixvpr_miner_margin", type=float, default=0.1, help="MixVPR train: miner margin")
@@ -175,8 +199,12 @@ def parse_args() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
     # MixVPR (train.py) — trainer
     p.add_argument("--mixvpr_encoder_arch", type=str, default="resnet50",
                    help="Backbone label for Lightning logs/checkpoints")
-    p.add_argument("--mixvpr_ckpt_monitor", type=str, default="pitts30k_val/R1",
-                   help="ModelCheckpoint monitor metric")
+    p.add_argument(
+        "--mixvpr_ckpt_monitor",
+        type=str,
+        default="msls_val/R1",
+        help="ModelCheckpoint monitor metric (must match a name in --mixvpr_val_sets)",
+    )
     p.add_argument("--mixvpr_ckpt_save_top_k", type=int, default=3, help="ModelCheckpoint save_top_k")
 
 
@@ -309,7 +337,10 @@ def normalize(merged: Dict[str, Any]) -> Dict[str, Any]:
         if k in out and out[k] is not None:
             out[k] = str(Path(out[k]).expanduser())
 
-    for element in ("datasets", "datasets_type", "losses", "mixvpr_val_sets"):
+    if out.get("no_mixvpr_pretrained"):
+        out["mixvpr_pretrained"] = False
+
+    for element in ("datasets", "datasets_type", "losses", "mixvpr_val_sets", "mixvpr_train_losses"):
         if element in out and out[element] is not None:
             v = out[element]
             if isinstance(v, list):
@@ -319,6 +350,13 @@ def normalize(merged: Dict[str, Any]) -> Dict[str, Any]:
                 out[element] = "all"
             else:
                 out[element] = [s.strip() for s in v.split(",") if s.strip()]
+
+    if out.get("mixvpr_basic_loss_type") is None and out.get("mixvpr_loss_name") is not None:
+        out["mixvpr_basic_loss_type"] = out["mixvpr_loss_name"]
+    if out.get("mixvpr_uncertainty_loss_weight") is None:
+        out["mixvpr_uncertainty_loss_weight"] = out.get("uncertainty_lambda", 1.0)
+    if out.get("mixvpr_uncertainty_loss_type") is None and out.get("uncertainty_loss") is not None:
+        out["mixvpr_uncertainty_loss_type"] = out["uncertainty_loss"]
 
     if "ece_metrics" in out and out["ece_metrics"] is not None:
         v = out["ece_metrics"]

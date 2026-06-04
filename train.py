@@ -4,17 +4,45 @@ import sys
 import pytorch_lightning as pl
 import torch
 from pytorch_lightning.callbacks import ModelCheckpoint
-# from pytorch_lightning.callbacks import Callback, ModelCheckpoint
 from torch.optim import lr_scheduler
-# from torch.optim import lr_scheduler, optimizer
 
 from configs.parser import build_config
 from data.GSVCitiesDataloader import GSVCitiesDataModule
 from losses.losses import get_loss, get_miner
+from losses.vmf_place_loss import place_centroid_targets
 from utils.runtime import init_model
-from validation import get_validation_recalls
+from utils.mixvpr_train_wandb import attach_wandb_callback
+# from utils.mixvpr_val_ece import attach_val_ece_callback  # old: second FAISS + ECE callback
+from utils.mixvpr_eval import run_mixvpr_lightning_val_eval, run_mixvpr_validation_eval
+from utils import wandb_utils
+# from validation import get_validation_recalls  # old: Lightning-only recall (PrettyTable)
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_ckpt_monitor(cfg: dict) -> str:
+    """ModelCheckpoint monitor must match a metric logged during validation."""
+    monitor = str(cfg.get("mixvpr_ckpt_monitor", "pitts30k_val/R1"))
+    val_sets = cfg.get("mixvpr_val_sets") or []
+    if isinstance(val_sets, str):
+        val_sets = [s.strip() for s in val_sets.split(",") if s.strip()]
+    else:
+        val_sets = list(val_sets)
+    if not val_sets:
+        return monitor
+    if "/" in monitor:
+        prefix = monitor.split("/", 1)[0]
+        if prefix in val_sets:
+            return monitor
+    resolved = f"{val_sets[0]}/R1"
+    if monitor != resolved:
+        logger.warning(
+            "mixvpr_ckpt_monitor=%r not in mixvpr_val_sets %s; using %r",
+            monitor,
+            val_sets,
+            resolved,
+        )
+    return resolved
 
 
 class VPRModel(pl.LightningModule):
@@ -22,68 +50,83 @@ class VPRModel(pl.LightningModule):
 
     def __init__(self, cfg, core: torch.nn.Module):
         super().__init__()
-        self.freeze_all = bool(cfg.get("freeze_model"))
+        self.freeze_base = bool(cfg.get("freeze_model"))
         self.freeze_batchnorm = bool(cfg.get("freeze_batchnorm"))
-        if self.freeze_all:
-            self.automatic_optimization = False
 
         self.encoder_arch = cfg.get("mixvpr_encoder_arch", "resnet50")
         self.lr = cfg["lr"]
+        self.head_lr = float(cfg.get("head_lr", 1e-3))
         self.optimizer = cfg["mixvpr_optimizer"]
         self.weight_decay = cfg["mixvpr_weight_decay"]
         self.momentum = cfg["mixvpr_momentum"]
         self.warmpup_steps = cfg["mixvpr_warmup_steps"]
         self.milestones = list(cfg["mixvpr_milestones"])
         self.lr_mult = cfg["mixvpr_lr_mult"]
+        self.faiss_gpu = bool(cfg.get("mixvpr_faiss_gpu"))
 
         loss_name = cfg["mixvpr_loss_name"]
+        uncertainty_loss = cfg["uncertainty_loss"]
+        active_losses = cfg["losses"]
+        uncertainty_lambda = cfg["uncertainty_lambda"]
+
         miner_name = cfg.get("mixvpr_miner_name") or ""
+        if "basic" not in active_losses:
+            miner_name = ""
         self.loss_name = loss_name
         self.miner_name = miner_name
         self.miner_margin = cfg["mixvpr_miner_margin"]
-        self.faiss_gpu = bool(cfg.get("mixvpr_faiss_gpu"))
 
         self.save_hyperparameters(ignore=["core"])
 
-        self.loss_fn = get_loss(loss_name)
+        self.uncertainty_lambda = float(uncertainty_lambda)
+        self.descriptors_dimension = int(cfg["descriptors_dimension"])
+        self.loss_basic, self.loss_uncertainty = get_loss(
+            loss_name, active_losses, uncertainty_loss, self.descriptors_dimension
+        )
         self.miner = get_miner(miner_name, self.miner_margin) if miner_name else None
         self.batch_acc = []
 
-        # Same descriptor path as eval.py (resize + backbone + aggregator + L2Norm).
         self.core = core
+        self._eval_cfg = cfg
+        self._wandb_cb = None
 
-    def on_train_epoch_start(self):
+    def _set_train_mode(self) -> None:
         self.train()
         if self.freeze_batchnorm:
             for m in self.modules():
                 if isinstance(m, torch.nn.BatchNorm2d):
                     m.eval()
+
+    def on_fit_start(self) -> None:
+        self._set_train_mode()
+
+    def on_train_epoch_start(self):
+        self._set_train_mode()
+        if self.freeze_batchnorm:
             logger.info("BatchNorm2d layers frozen (freeze_batchnorm)")
 
     def forward(self, x):
-        descriptors, _ = self.core(x)
-        return descriptors
+        descriptors, variances = self.core(x)
+        return descriptors, variances
 
-    # configure the optimizer
     def configure_optimizers(self):
         trainable = [p for p in self.parameters() if p.requires_grad]
         if not trainable:
-            # Frozen sanity run: optimizer is unused (no grads); satisfy Lightning API.
-            trainable = [torch.nn.Parameter(torch.zeros(1, requires_grad=True))]
+            raise ValueError(
+                "No trainable parameters. With --freeze_model, use model_mode=uncertainty "
+                "so var_head (and final_l2) remain trainable."
+            )
+        opt_lr = self.head_lr if self.freeze_base else self.lr
         if self.optimizer.lower() == "sgd":
             optim = torch.optim.SGD(
                 trainable,
-                lr=self.lr,
+                lr=opt_lr,
                 weight_decay=self.weight_decay,
                 momentum=self.momentum,
             )
-        elif self.optimizer.lower() == "adamw":
+        elif self.optimizer.lower() in ("adamw", "adam"):
             optim = torch.optim.AdamW(
-                self.parameters(), lr=self.lr, weight_decay=self.weight_decay
-            )
-        elif self.optimizer.lower() == "adam":
-            optim = torch.optim.AdamW(
-                self.parameters(), lr=self.lr, weight_decay=self.weight_decay
+                trainable, lr=opt_lr, weight_decay=self.weight_decay
             )
         else:
             raise ValueError(
@@ -94,149 +137,130 @@ class VPRModel(pl.LightningModule):
         )
         return [optim], [scheduler]
 
-    # configure the optizer step, takes into account the warmup stage
-    # Lightning 2.x passes optimizer_closure as the 4th arg (no optimizer_idx / on_tpu kwargs).
     def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure=None):
         del epoch, batch_idx
+        base_lr = self.head_lr if self.freeze_base else self.lr
         if self.trainer.global_step < self.warmpup_steps:
             lr_scale = min(1.0, float(self.trainer.global_step + 1) / self.warmpup_steps)
             for pg in optimizer.param_groups:
-                pg["lr"] = lr_scale * self.lr
+                pg["lr"] = lr_scale * base_lr
         optimizer.step(closure=optimizer_closure)
 
-    # The loss function call (this method will be called at each training iteration)
-    def loss_function(self, descriptors, labels):
-        # we mine the pairs/triplets if there is an online mining strategy
+    def _uncertainty_loss(self, descriptors, labels, variances):
+        targets = place_centroid_targets(descriptors, labels)
+        kappa = variances.mean(dim=-1, keepdim=True)
+        return self.uncertainty_lambda * self.loss_uncertainty(descriptors, kappa, targets)
+
+    def loss_function(self, descriptors, labels, variances=None):
+        loss = torch.tensor(0.0, device=descriptors.device, dtype=descriptors.dtype)
+        batch_acc = 0.0
+
         if self.miner is not None:
             miner_outputs = self.miner(descriptors, labels)
-            loss = self.loss_fn(descriptors, labels, miner_outputs)
-
-            # calculate the % of trivial pairs/triplets
-            # which do not contribute in the loss value
+            if self.loss_basic is not None:
+                loss = loss + self.loss_basic(descriptors, labels, miner_outputs)
+            if self.loss_uncertainty is not None and variances is not None:
+                loss = loss + self._uncertainty_loss(descriptors, labels, variances)
             nb_samples = descriptors.shape[0]
             nb_mined = len(set(miner_outputs[0].detach().cpu().numpy()))
             batch_acc = 1.0 - (nb_mined / nb_samples)
+        else:
+            if self.loss_basic is not None:
+                basic_out = self.loss_basic(descriptors, labels)
+                if isinstance(basic_out, tuple):
+                    loss, batch_acc = basic_out
+                else:
+                    loss = loss + basic_out
+            if self.loss_uncertainty is not None and variances is not None:
+                loss = loss + self._uncertainty_loss(descriptors, labels, variances)
 
-        else:  # no online mining
-            loss = self.loss_fn(descriptors, labels)
-            batch_acc = 0.0
-            if type(loss) == tuple:
-                # somes losses do the online mining inside (they don't need a miner objet),
-                # so they return the loss and the batch accuracy
-                # for example, if you are developping a new loss function, you might be better
-                # doing the online mining strategy inside the forward function of the loss class,
-                # and return a tuple containing the loss value and the batch_accuracy
-                # (the % of valid pairs or triplets)
-                loss, batch_acc = loss
-
-        # keep accuracy of every batch and later reset it at epoch start
         self.batch_acc.append(batch_acc)
-        # log it
         self.log(
             "b_acc", sum(self.batch_acc) / len(self.batch_acc), prog_bar=True, logger=True
         )
         return loss
 
-    # This is the training step that's executed at each iteration
     def training_step(self, batch, batch_idx):
         places, labels = batch
-
-        # Note that GSVCities yields places (each containing N images)
-        # which means the dataloader will return a batch containing BS places
         bs, n, ch, h, w = places.shape
-
-        # reshape places and labels
         images = places.view(bs * n, ch, h, w)
         labels = labels.view(-1)
 
-        # Feed forward the batch to the model
-        descriptors = self(images)  # Here we are calling the method forward that we defined above
-        loss = self.loss_function(descriptors, labels)  # Call the loss_function we defined above
+        descriptors, variances = self(images)
+        loss = self.loss_function(descriptors, labels, variances)
+
+        if self._wandb_cb is not None:
+            self._wandb_cb.record_train_batch(self, loss, variances, descriptors, labels)
 
         self.log("loss", loss.item(), logger=True)
-        if self.freeze_all:
-            return None
         return {"loss": loss}
 
-    # Lightning 2.x: replaces training_epoch_end (removed in PL2).
     def on_train_epoch_end(self):
         self.batch_acc = []
 
-    # Lightning 2.x: validation_epoch_end removed; accumulate step outputs for on_validation_epoch_end.
     def on_validation_epoch_start(self):
         self._val_feats_by_dl = {}
+        self._val_vars_by_dl = {}
 
-    # For validation, we will also iterate step by step over the validation set
-    # this is the way Pytorch Lghtning is made. All about modularity, folks.
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         images, _ = batch
-        # places, _ = batch
-        # calculate descriptors
-        descriptors = self(images)
-        # descriptors = self(places)
+        descriptors, variances = self(images)
+        if self._wandb_cb is not None:
+            self._wandb_cb.record_val_batch(variances)
         out = descriptors.detach().cpu()
-        # Lightning 2.x: collect descriptors here (see on_validation_epoch_end).
         dl_idx = 0 if dataloader_idx is None else int(dataloader_idx)
         self._val_feats_by_dl.setdefault(dl_idx, []).append(out)
+        self._val_vars_by_dl.setdefault(dl_idx, []).append(variances.detach().cpu())
         return out
 
-    # Lightning 2.x: replaces validation_epoch_end (removed in PL2).
     def on_validation_epoch_end(self):
-        """Descriptors ordered refs then queries per val set (MSLS / Pitts)."""
-        dm = self.trainer.datamodule
-        val_step_outputs = [
-            self._val_feats_by_dl.get(i, []) for i in range(len(dm.val_datasets))
-        ]
-        # The following line is a hack: if we have only one validation set, then
-        # we need to put the outputs in a list (Pytorch Lightning does not do it presently)
-        if len(dm.val_datasets) == 1:  # we need to put the outputs in a list
-            val_step_outputs = [val_step_outputs]
+        """Same metrics as eval.py: one FAISS pass + PrettyTable recall on stdout."""
+        run_mixvpr_lightning_val_eval(self, self._eval_cfg)
 
-        for i, (val_set_name, val_dataset) in enumerate(
-            zip(dm.val_set_names, dm.val_datasets)
-        ):
-            feats = torch.concat(val_step_outputs[i], dim=0)
-
-            if "pitts" in val_set_name:
-                # split to ref and queries
-                num_references = val_dataset.dbStruct.numDb
-                # num_queries = len(val_dataset) - num_references
-                positives = val_dataset.getPositives()
-            elif "msls" in val_set_name:
-                # split to ref and queries
-                num_references = val_dataset.num_references
-                # num_queries = len(val_dataset) - num_references
-                positives = val_dataset.pIdx
-            else:
-                print(f"Please implement validation_epoch_end for {val_set_name}")
-                raise NotImplementedError(f"validation_epoch_end for {val_set_name}")
-
-            r_list = feats[:num_references]
-            q_list = feats[num_references:]
-            pitts_dict = get_validation_recalls(
-                r_list=r_list,
-                q_list=q_list,
-                k_values=[1, 5, 10, 15, 20, 50, 100],
-                gt=positives,
-                print_results=True,
-                dataset_name=val_set_name,
-                faiss_gpu=self.faiss_gpu,
-            )
-            # del r_list, q_list, feats, num_references, positives
-
-            self.log(f"{val_set_name}/R1", pitts_dict[1], prog_bar=False, logger=True)
-            self.log(f"{val_set_name}/R5", pitts_dict[5], prog_bar=False, logger=True)
-            self.log(f"{val_set_name}/R10", pitts_dict[10], prog_bar=False, logger=True)
-        print("\n\n")
+        # --- old Lightning validation (get_validation_recalls + MixVPRValEceCallback) ---
+        # dm = self.trainer.datamodule
+        # val_step_outputs = [
+        #     self._val_feats_by_dl.get(i, []) for i in range(len(dm.val_datasets))
+        # ]
+        # if len(dm.val_datasets) == 1:
+        #     val_step_outputs = [val_step_outputs]
+        # for i, (val_set_name, val_dataset) in enumerate(
+        #     zip(dm.val_set_names, dm.val_datasets)
+        # ):
+        #     feats = torch.concat(val_step_outputs[i], dim=0)
+        #     if "pitts" in val_set_name:
+        #         num_references = val_dataset.dbStruct.numDb
+        #         positives = val_dataset.getPositives()
+        #     elif "msls" in val_set_name:
+        #         num_references = val_dataset.num_references
+        #         positives = val_dataset.pIdx
+        #     else:
+        #         raise NotImplementedError(f"validation_epoch_end for {val_set_name}")
+        #     r_list = feats[:num_references]
+        #     q_list = feats[num_references:]
+        #     pitts_dict = get_validation_recalls(
+        #         r_list=r_list,
+        #         q_list=q_list,
+        #         k_values=[1, 5, 10, 15, 20, 50, 100],
+        #         gt=positives,
+        #         print_results=True,
+        #         dataset_name=val_set_name,
+        #         faiss_gpu=self.faiss_gpu,
+        #     )
+        #     self.log(f"{val_set_name}/R1", pitts_dict[1], prog_bar=False, logger=True)
+        #     self.log(f"{val_set_name}/R5", pitts_dict[5], prog_bar=False, logger=True)
+        #     self.log(f"{val_set_name}/R10", pitts_dict[10], prog_bar=False, logger=True)
+        # print("\n\n")
 
 
-def _collect_recall_metrics(trainer: pl.Trainer) -> dict:
-    out = {}
-    for key, value in trainer.callback_metrics.items():
-        name = str(key)
-        if name.endswith("/R1") or name.endswith("/R5") or name.endswith("/R10"):
-            out[name] = float(value.detach().cpu()) if torch.is_tensor(value) else float(value)
-    return out
+# def _collect_recall_metrics(trainer: pl.Trainer) -> dict:
+#     """Used with trainer.validate; pre/post train now use run_mixvpr_validation_eval."""
+#     out = {}
+#     for key, value in trainer.callback_metrics.items():
+#         name = str(key)
+#         if name.endswith("/R1") or name.endswith("/R5") or name.endswith("/R10"):
+#             out[name] = float(value.detach().cpu()) if torch.is_tensor(value) else float(value)
+#     return out
 
 
 def _print_recall_comparison(before: dict, after: dict) -> None:
@@ -262,12 +286,10 @@ if __name__ == "__main__":
     if cfg.get("log_dir"):
         logger.info("The outputs are being saved in %s", cfg["log_dir"])
 
-    # Lightning 2.x: pl.seed_everything (replaces pl.utilities.seed.seed_everything).
     seed = cfg["seed"] if cfg["seed"] != -1 else 190223
     pl.seed_everything(seed=seed, workers=True)
 
-    _device, core = init_model(cfg)
-    del _device
+    device, core = init_model(cfg)
 
     img_side = int(cfg["image_size"])
     datamodule = GSVCitiesDataModule(
@@ -284,11 +306,16 @@ if __name__ == "__main__":
         positive_dist_threshold=cfg["positive_dist_threshold"],
     )
 
-    model = VPRModel(cfg, core=core)
-
     callbacks = []
+    wandb_cb = attach_wandb_callback(cfg, callbacks)
+
+    model = VPRModel(cfg, core=core)
+    if wandb_cb is not None:
+        model._wandb_cb = wandb_cb
+    # attach_val_ece_callback(cfg, callbacks)  # old: duplicate FAISS for ECE only
+
     if not cfg.get("no_checkpoint"):
-        ckpt_monitor = cfg["mixvpr_ckpt_monitor"]
+        ckpt_monitor = _resolve_ckpt_monitor(cfg)
         callbacks.append(
             ModelCheckpoint(
                 monitor=ckpt_monitor,
@@ -303,8 +330,6 @@ if __name__ == "__main__":
             )
         )
 
-    # ------------------
-    # we instanciate a trainer
     use_gpu = cfg["device"] == "cuda"
     default_root_dir = f"./LOGS/{model.encoder_arch}"
     trainer = pl.Trainer(
@@ -318,18 +343,27 @@ if __name__ == "__main__":
         callbacks=callbacks,
         reload_dataloaders_every_n_epochs=1 if cfg["reload_dataloaders"] else 0,
         log_every_n_steps=cfg["log_every_n_steps"],
-        # fast_dev_run=True  # uncomment for one-iteration smoke test
     )
 
     datamodule.setup("fit")
     recalls_before = None
-    if cfg.get("validate_before_fit") or cfg.get("freeze_model"):
-        print("\n>>> Validation BEFORE training\n")
-        trainer.validate(model=model, datamodule=datamodule)
-        recalls_before = _collect_recall_metrics(trainer)
+    # if cfg.get("validate_before_fit") or cfg.get("freeze_model"):
+    #     print("\n>>> eval.py validation BEFORE training\n")
+    #     # print("\n>>> Validation BEFORE training\n")
+    #     # trainer.validate(model=model, datamodule=datamodule)
+    #     # recalls_before = _collect_recall_metrics(trainer)
+    #     recalls_before = run_mixvpr_validation_eval(
+    #         cfg, core, device, wandb_step=0, use_descriptor_cache=False
+    #     )
 
+    model._set_train_mode()
     trainer.fit(model=model, datamodule=datamodule)
 
     if cfg.get("freeze_model") and recalls_before is not None:
-        recalls_after = _collect_recall_metrics(trainer)
+        print("\n>>> eval.py validation AFTER training\n")
+        recalls_after = run_mixvpr_validation_eval(
+            cfg, core, device, wandb_step=cfg.get("epochs_num", 0), use_descriptor_cache=False
+        )
         _print_recall_comparison(recalls_before, recalls_after)
+
+    wandb_utils.finish_train_run(cfg)

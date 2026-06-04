@@ -182,51 +182,57 @@ def _compute_uncertainty_block(
     return uncertainty_aucpr, uncertainty_ece_results, uncertainty_raw_scores, uncertainty_stats
 
 
-def eval_dataset(
-    args,
-    model,
-    device,
-    dataset_name,
-    eval_ds_path,
-    queries_folder_name="queries",
-    wandb_step=None,
-    log_dataset_info=True,
-    base_dataset_name=None,
-    cached_db_desc=None,
-    cached_db_var=None,
-    use_descriptor_cache=True,
+def _log_retrieval_console(
+    args: Dict[str, Any],
+    dataset_name: str,
+    recalls: np.ndarray,
+    recalls_str: str,
+    map_at_k: Optional[List],
+) -> None:
+    """MixVPR: PrettyTable to stdout; otherwise eval.py logger lines."""
+    if not args.get("use_labels"):
+        return
+    if args.get("mixvpr_recall_pretty_table"):
+        from validation import MIXVPR_VAL_RECALL_K_VALUES, print_recall_pretty_table
+
+        k_values = args.get("mixvpr_recall_k_values", MIXVPR_VAL_RECALL_K_VALUES)
+        print_recall_pretty_table(recalls, k_values, dataset_name)
+    else:
+        # --- old eval.py console (logger, not PrettyTable) ---
+        # if args["use_labels"]:
+        #     log_retrieval_results(dataset_name, recalls_str, recalls, map_at_k, args["recall_values"])
+        log_retrieval_results(dataset_name, recalls_str, recalls, map_at_k, args["recall_values"])
+
+
+def evaluate_from_descriptors(
+    args: Dict[str, Any],
+    test_ds: TestDataset,
+    dataset_name: str,
+    db_desc: np.ndarray,
+    q_desc: np.ndarray,
+    db_var: np.ndarray,
+    q_var: np.ndarray,
+    *,
+    wandb_step: Optional[int] = None,
+    dataset_output_dir: Optional[Path] = None,
+    log_dataset_info: bool = False,
+    base_dataset_name: Optional[str] = None,
+    queries_folder_name: str = "queries",
+    save_recalls: bool = False,
 ) -> EvalDatasetResult:
-    """
-    Evaluate the model on a single dataset.
-    Extracts features once, then computes recalls and uncertainty metrics.
-    """
-    model = model.eval()
-    dataset_output_dir = Path(args["log_dir"]) / "eval" / dataset_name
-    if not args["dry_run"] or args.get("use_wandb"):
+    """One retrieval + recall/ECE/variance from precomputed descriptors."""
+    if dataset_output_dir is None:
+        dataset_output_dir = Path(args["log_dir"]) / "eval" / dataset_name
+    if not args.get("dry_run") or args.get("use_wandb"):
         dataset_output_dir.mkdir(parents=True, exist_ok=True)
 
-    test_ds = TestDataset(
-        f"{eval_ds_path}/database",
-        f"{eval_ds_path}/{queries_folder_name}",
-        positive_dist_threshold=args["positive_dist_threshold"],
-        image_size=args.get("image_size"),
-        use_labels=args["use_labels"],
-        resize_test_imgs=args.get("resize_test_imgs", False),
-    )
     if log_dataset_info:
-        logger.info(f"Testing on {test_ds}")
+        logger.info("Testing on %s", test_ds)
 
-    db_desc, q_desc, db_var, q_var = extract_descriptors(
-        args,
-        model,
-        device,
-        test_ds,
-        dataset_name,
-        base_dataset_name=base_dataset_name,
-        cached_db_desc=cached_db_desc,
-        cached_db_var=cached_db_var,
-        use_descriptor_cache=use_descriptor_cache,
-    )
+    db_desc = np.asarray(db_desc, dtype=np.float32)
+    q_desc = np.asarray(q_desc, dtype=np.float32)
+    db_var = np.asarray(db_var, dtype=np.float32)
+    q_var = np.asarray(q_var, dtype=np.float32)
 
     predictions, distances, recalls, recalls_str, positives_per_query, map_at_k = run_retrieval(
         args,
@@ -234,7 +240,7 @@ def eval_dataset(
         db_desc,
         q_desc,
         dataset_output_dir,
-        save_recalls=use_descriptor_cache,
+        save_recalls=save_recalls,
     )
 
     uncertainty_aucpr = baseline_results = uncertainty_stats = None
@@ -242,8 +248,7 @@ def eval_dataset(
     uncertainty_raw_scores: Dict[str, Any] = {}
     save_plots = args.get("save_plots", False) or args.get("use_wandb", False)
 
-    if args["use_labels"]:
-        log_retrieval_results(dataset_name, recalls_str, recalls, map_at_k, args["recall_values"])
+    _log_retrieval_console(args, dataset_name, recalls, recalls_str, map_at_k)
 
     if args["model_mode"] == "uncertainty":
         uncertainty_aucpr, uncertainty_ece_results, uncertainty_raw_scores, uncertainty_stats = (
@@ -337,3 +342,71 @@ def eval_dataset(
         db_desc=db_desc,
         db_var=db_var,
     )
+
+
+def eval_dataset(
+    args,
+    model,
+    device,
+    dataset_name,
+    eval_ds_path,
+    queries_folder_name="queries",
+    wandb_step=None,
+    log_dataset_info=True,
+    base_dataset_name=None,
+    cached_db_desc=None,
+    cached_db_var=None,
+    use_descriptor_cache=True,
+) -> EvalDatasetResult:
+    """
+    Evaluate the model on a single dataset.
+    Extracts features once, then computes recalls and uncertainty metrics.
+    """
+    was_training = model.training
+    model.eval()
+    dataset_output_dir = Path(args["log_dir"]) / "eval" / dataset_name
+    if not args["dry_run"] or args.get("use_wandb"):
+        dataset_output_dir.mkdir(parents=True, exist_ok=True)
+
+    test_ds = TestDataset(
+        f"{eval_ds_path}/database",
+        f"{eval_ds_path}/{queries_folder_name}",
+        positive_dist_threshold=args["positive_dist_threshold"],
+        image_size=args.get("image_size"),
+        use_labels=args["use_labels"],
+        resize_test_imgs=args.get("resize_test_imgs", False),
+    )
+    if log_dataset_info:
+        logger.info(f"Testing on {test_ds}")
+
+    # --- old eval_dataset body (inline retrieval + log_retrieval_results) was here ---
+    try:
+        db_desc, q_desc, db_var, q_var = extract_descriptors(
+            args,
+            model,
+            device,
+            test_ds,
+            dataset_name,
+            base_dataset_name=base_dataset_name,
+            cached_db_desc=cached_db_desc,
+            cached_db_var=cached_db_var,
+            use_descriptor_cache=use_descriptor_cache,
+        )
+
+        return evaluate_from_descriptors(
+            args,
+            test_ds,
+            dataset_name,
+            db_desc,
+            q_desc,
+            db_var,
+            q_var,
+            wandb_step=wandb_step,
+            dataset_output_dir=dataset_output_dir,
+            log_dataset_info=False,
+            base_dataset_name=base_dataset_name,
+            queries_folder_name=queries_folder_name,
+            save_recalls=use_descriptor_cache,
+        )
+    finally:
+        model.train(was_training)

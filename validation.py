@@ -4,6 +4,26 @@ import faiss
 import faiss.contrib.torch_utils
 from prettytable import PrettyTable
 
+# Same k list as legacy MixVPR Lightning validation (``on_validation_epoch_end``).
+MIXVPR_VAL_RECALL_K_VALUES = [1, 5, 10, 15, 20, 50, 100]
+
+
+def print_recall_pretty_table(
+    recalls,
+    k_values,
+    dataset_name: str,
+) -> None:
+    """Print the legacy PrettyTable (recalls in percent, 0–100)."""
+    print()
+    table = PrettyTable()
+    k_list = list(k_values)
+    table.field_names = ["K"] + [str(k) for k in k_list]
+    row = []
+    for i in range(len(k_list)):
+        row.append(f"{float(recalls[i]) if i < len(recalls) else 0.0:.2f}")
+    table.add_row(["Recall@K"] + row)
+    print(table.get_string(title=f"Performances on {dataset_name}"))
+
 
 def _faiss_inputs(r_list, q_list):
     """FAISS torch utils require float32 (Lightning 16-mixed val may output float16)."""
@@ -46,10 +66,14 @@ def get_validation_recalls(r_list, q_list, k_values, gt, print_results=True, fai
         d = {k:v for (k,v) in zip(k_values, correct_at_k)}
 
         if print_results:
-            print() # print a new line
-            table = PrettyTable()
-            table.field_names = ['K']+[str(k) for k in k_values]
-            table.add_row(['Recall@K']+ [f'{100*v:.2f}' for v in correct_at_k])
-            print(table.get_string(title=f"Performances on {dataset_name}"))
+            # --- old inline PrettyTable (kept for reference) ---
+            # print()
+            # table = PrettyTable()
+            # table.field_names = ['K'] + [str(k) for k in k_values]
+            # table.add_row(['Recall@K'] + [f'{100 * v:.2f}' for v in correct_at_k])
+            # print(table.get_string(title=f"Performances on {dataset_name}"))
+            print_recall_pretty_table(
+                [100 * float(v) for v in correct_at_k], k_values, dataset_name
+            )
         
         return d

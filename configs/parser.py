@@ -203,7 +203,8 @@ def parse_args() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
         "--mixvpr_ckpt_monitor",
         type=str,
         default="msls_val/R1",
-        help="ModelCheckpoint monitor metric (must match a name in --mixvpr_val_sets)",
+        help="Legacy ModelCheckpoint monitor; train.py prefers the first ece_recall_* (or recall) "
+        "from --early_stop_metric instead.",
     )
     p.add_argument("--mixvpr_ckpt_save_top_k", type=int, default=3, help="ModelCheckpoint save_top_k")
 

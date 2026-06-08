@@ -93,3 +93,61 @@ def is_improvement(metric: str, current: float, best_so_far: float) -> bool:
     if metric == "recall":
         return current > best_so_far
     return current < best_so_far
+
+
+def _first_val_set_name(cfg: dict) -> str:
+    val_sets = cfg.get("mixvpr_val_sets") or []
+    if isinstance(val_sets, str):
+        val_sets = [s.strip() for s in val_sets.split(",") if s.strip()]
+    else:
+        val_sets = list(val_sets)
+    return val_sets[0] if val_sets else "val"
+
+
+def lightning_ckpt_metric_name(early_stop_metric: str, val_set_name: str) -> str:
+    """Map canonical early-stop id to the scalar logged by ``panel_to_train_val_metrics``."""
+    if early_stop_metric == "recall":
+        return f"{val_set_name}/R1"
+    if early_stop_metric.startswith("ece_recall_"):
+        k = int(early_stop_metric.rsplit("_", 1)[-1])
+        return f"{val_set_name}/ece_kappa_recall_{k:02d}"
+    raise ValueError(f"Unsupported early_stop metric for Lightning checkpoint: {early_stop_metric!r}")
+
+
+def lightning_ckpt_filename_tag(early_stop_metric: str) -> str:
+    if early_stop_metric == "recall":
+        return "R1"
+    if early_stop_metric.startswith("ece_recall_"):
+        k = int(early_stop_metric.rsplit("_", 1)[-1])
+        return f"ece_r{k:02d}"
+    return early_stop_metric.replace("/", "_")
+
+
+def resolve_lightning_ckpt_monitor(cfg: dict) -> tuple[str, str, str]:
+    """Return ``(monitor, mode, filename_tag)`` for ``ModelCheckpoint``.
+
+    Uses the first ``ece_recall_*`` in ``early_stop_metrics``, else ``recall``,
+    else falls back to ``mixvpr_ckpt_monitor`` (legacy).
+    """
+    val_set = _first_val_set_name(cfg)
+    early_stop_metrics = list(cfg.get("early_stop_metrics") or ["recall"])
+
+    for metric in early_stop_metrics:
+        if metric.startswith("ece_recall_"):
+            return (
+                lightning_ckpt_metric_name(metric, val_set),
+                "min",
+                lightning_ckpt_filename_tag(metric),
+            )
+
+    if "recall" in early_stop_metrics:
+        return lightning_ckpt_metric_name("recall", val_set), "max", "R1"
+
+    legacy = str(cfg.get("mixvpr_ckpt_monitor", f"{val_set}/R1"))
+    if "/" in legacy:
+        prefix, suffix = legacy.split("/", 1)
+        if val_set and prefix not in (val_set,):
+            legacy = f"{val_set}/{suffix}"
+    mode = "max" if legacy.endswith("/R1") else "min"
+    tag = legacy.split("/")[-1].replace("ece_kappa_recall_", "ece_r")
+    return legacy, mode, tag

@@ -9,8 +9,13 @@ import torch
 
 from data.mixvpr_val_dataset import VAL_SET_MAP, load_val_dataset_paths
 from eval_metrics.dataset_eval import EvalDatasetResult, eval_dataset, evaluate_from_descriptors
-from eval_metrics.eval_wandb import panel_to_wandb_metrics
+from eval_metrics.eval_wandb import (
+    build_training_val_ece_wandb_payload,
+    ece_curves_wandb_payload,
+    panel_to_wandb_metrics,
+)
 from utils import wandb_utils
+from utils.mixvpr_train_wandb import MixVPRValEvalBundle
 from validation import MIXVPR_VAL_RECALL_K_VALUES, print_recall_pretty_table
 
 if TYPE_CHECKING:
@@ -83,6 +88,9 @@ def log_mixvpr_eval_result(
     *,
     pl_module: Optional["pl.LightningModule"] = None,
     wandb_step: Optional[int] = None,
+    dataset_output_dir: Optional[Path] = None,
+    log_wandb: bool = True,
+    training_wandb_layout: bool = False,
 ) -> Dict[str, float]:
     """Log scalars to Lightning and W&B; return flat train-style metric dict."""
     panel = result.panel_data or {}
@@ -92,20 +100,29 @@ def log_mixvpr_eval_result(
         for k, v in train_metrics.items():
             pl_module.log(k, v, prog_bar=False, logger=True, on_epoch=True)
 
-    if cfg.get("use_wandb") and panel:
-        wm = panel_to_wandb_metrics(panel, wandb_step=wandb_step)
-        wandb_utils.log_wandb(wm, step=wandb_step if wandb_step is not None else 0)
-        if result.wandb_images:
-            # --- old (breaks when predictions value is a list of paths) ---
-            # img_metrics = {k: _wandb.Image(str(Path(p))) for k, p in result.wandb_images.items()}
-            dataset_name = panel.get("dataset_name", val_set_name)
-            media = wandb_utils._collect_eval_media_for_dataset(
-                dataset_name, result.wandb_images
+    if cfg.get("use_wandb") and panel and log_wandb:
+        step = wandb_step if wandb_step is not None else 0
+        out_dir = dataset_output_dir
+        if out_dir is None and cfg.get("log_dir"):
+            out_dir = Path(cfg["log_dir"]) / "eval" / panel.get("dataset_name", val_set_name)
+
+        if training_wandb_layout:
+            payload = build_training_val_ece_wandb_payload(
+                panel, result.wandb_images, out_dir, cfg
             )
-            if media:
-                wandb_utils.log_wandb(
-                    media, step=wandb_step if wandb_step is not None else 0
+        else:
+            payload = dict(panel_to_wandb_metrics(panel, wandb_step=wandb_step))
+            dataset_name = panel.get("dataset_name", val_set_name)
+            if result.wandb_images:
+                payload.update(
+                    wandb_utils._collect_eval_media_for_dataset(dataset_name, result.wandb_images)
                 )
+            ece_media = ece_curves_wandb_payload(dataset_name, out_dir)
+            if ece_media:
+                payload.update(ece_media)
+
+        if payload:
+            wandb_utils.log_wandb(payload, step=step)
 
     return train_metrics
 
@@ -162,7 +179,11 @@ def run_mixvpr_validation_eval(
         print_mixvpr_val_recalls(val_set_name, results.recalls, eval_cfg.get("recall_values"))
         metrics.update(
             log_mixvpr_eval_result(
-                results, val_set_name, eval_cfg, wandb_step=wandb_step
+                results,
+                val_set_name,
+                eval_cfg,
+                wandb_step=wandb_step,
+                training_wandb_layout=bool(eval_cfg.get("use_wandb")),
             )
         )
 
@@ -172,15 +193,19 @@ def run_mixvpr_validation_eval(
 def run_mixvpr_lightning_val_eval(
     pl_module: "pl.LightningModule",
     cfg: Dict[str, Any],
-) -> None:
+) -> List[MixVPRValEvalBundle]:
     """
     After ``validation_step`` buffers are full: one ``evaluate_from_descriptors`` per val set.
+    W&B logging is deferred to ``MixVPRTrainWandbCallback`` (train/val/ece panels).
     """
     dm = pl_module.trainer.datamodule
     feats_by_dl = getattr(pl_module, "_val_feats_by_dl", None) or {}
     vars_by_dl = getattr(pl_module, "_val_vars_by_dl", None) or {}
+    bundles: List[MixVPRValEvalBundle] = []
+    pl_module._mixvpr_val_eval_bundles = bundles
+
     if not getattr(dm, "val_datasets", None):
-        return
+        return bundles
 
     eval_cfg = _prepare_mixvpr_eval_cfg(cfg)
     step = pl_module.trainer.current_epoch
@@ -230,5 +255,9 @@ def run_mixvpr_lightning_val_eval(
             eval_cfg,
             pl_module=pl_module,
             wandb_step=step,
+            dataset_output_dir=out_dir,
+            log_wandb=False,
         )
+        bundles.append(MixVPRValEvalBundle(val_set_name, result, out_dir))
     print("\n\n")
+    return bundles

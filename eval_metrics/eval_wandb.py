@@ -43,6 +43,9 @@ ECE_CURVES_PANEL_VARIANTS = (
     "sue_log",
 )
 
+# Training val loop: learned uncertainty curves only (baselines are not computed).
+UNCERTAINTY_ECE_CURVES_VARIANTS = tuple(k for k, _ in UNCERTAINTY_ECE_VARIANTS)
+
 # W&B summary panel prefix and columns (values from panel["auc_pr"]).
 AUC_PR_PANEL_KEY = "AUC-PR"
 
@@ -306,17 +309,116 @@ def collect_ece_curve_images(
     output_dir: Optional[Path],
     *,
     plot_prefix: Optional[str] = None,
+    variants: Sequence[str] = ECE_CURVES_PANEL_VARIANTS,
 ) -> Dict[str, Path]:
     """Collect ``plot_ece`` PNGs for the fixed ECE-curves panel variants."""
     if output_dir is None or not output_dir.exists():
         return {}
 
     images: Dict[str, Path] = {}
-    for variant in ECE_CURVES_PANEL_VARIANTS:
+    for variant in variants:
         path = _curve_png_path(output_dir, variant, plot_prefix=plot_prefix)
         if path.exists():
             images[variant] = path.resolve()
     return images
+
+
+def ece_curves_wandb_payload(
+    dataset_name: str,
+    output_dir: Optional[Path],
+    *,
+    variants: Sequence[str] = ECE_CURVES_PANEL_VARIANTS,
+    show_missing: bool = True,
+) -> Dict[str, Any]:
+    """W&B media keys for the tiled ECE-curves panel (per dataset output dir)."""
+    curve_images = collect_ece_curve_images(output_dir, variants=variants)
+    if not curve_images:
+        return {}
+    return _ece_curves_log_keys(
+        dataset_name, curve_images, panel_variants=variants, show_missing=show_missing
+    )
+
+
+def _primary_ece_variant(panel: Dict[str, Any]) -> Optional[str]:
+    keys = _uncertainty_variant_keys(panel)
+    if "kappa" in keys:
+        return "kappa"
+    return next(iter(sorted(keys)), None)
+
+
+def build_training_val_ece_wandb_payload(
+    panel: Dict[str, Any],
+    wandb_images: Optional[Dict[str, Any]],
+    dataset_output_dir: Optional[Path],
+    cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    """W&B ``val/`` + ``ece/`` + ``ece_curves/`` panels from one eval ``panel_data`` (train loop)."""
+    import wandb as _wandb
+
+    payload: Dict[str, Any] = {}
+    dataset_name = panel.get("dataset_name", "val")
+
+    for k, v in panel.get("recalls", {}).items():
+        payload[f"val/recall_{int(k):02d}"] = float(v)
+
+    stats = panel.get("variance_stat") or {}
+
+    def _pick(*keys: str) -> Optional[float]:
+        for key in keys:
+            val = stats.get(key)
+            if isinstance(val, (int, float, np.floating)):
+                return float(val)
+        return None
+
+    vmin = _pick("q_min", "min")
+    vmax = _pick("q_max", "max")
+    vmean = _pick("q_mean", "mean")
+    vstd = _pick("q_std", "std")
+    vmed = _pick("q_median", "median")
+    if vmin is not None:
+        payload["val/variances_min"] = vmin
+    if vmax is not None:
+        payload["val/variances_max"] = vmax
+    if vmean is not None:
+        payload["val/variances_mean"] = vmean
+    if vstd is not None:
+        payload["val/variances_std"] = vstd
+    if vmed is not None:
+        payload["val/variances_median"] = vmed
+
+    variant = _primary_ece_variant(panel)
+    if variant:
+        ece_by_k = panel.get("ece_recall", {}).get(variant, {})
+        recall_k = cfg.get("recall_values", [1, 5, 10, 20])
+        for k in recall_k:
+            if k in ece_by_k:
+                payload[f"ece/ece_r{k}"] = float(ece_by_k[k])
+
+    payload.update(
+        ece_curves_wandb_payload(
+            dataset_name,
+            dataset_output_dir,
+            variants=UNCERTAINTY_ECE_CURVES_VARIANTS,
+            show_missing=False,
+        )
+    )
+
+    if wandb_images:
+        prefix = f"Eval_{dataset_name}/"
+        var_key = f"{prefix}variance_distribution"
+        if var_key in wandb_images:
+            p = Path(wandb_images[var_key])
+            if p.exists():
+                payload["val/variance_distribution"] = _wandb.Image(str(p))
+        preds_key = f"{prefix}predictions"
+        if preds_key in wandb_images:
+            img_list = wandb_images[preds_key]
+            if isinstance(img_list, list):
+                valid = [Path(p) for p in img_list if Path(p).exists()]
+                if valid:
+                    payload["val/predictions"] = [_wandb.Image(str(p)) for p in valid]
+
+    return payload
 
 
 def collect_bins_distribution_images(
@@ -381,7 +483,13 @@ def _bins_distribution_log_keys(name: str, bins_images: Dict[str, Any]) -> Dict[
     return payload
 
 
-def _ece_curves_log_keys(name: str, curve_images: Dict[str, Any]) -> Dict[str, Any]:
+def _ece_curves_log_keys(
+    name: str,
+    curve_images: Dict[str, Any],
+    *,
+    panel_variants: Sequence[str] = ECE_CURVES_PANEL_VARIANTS,
+    show_missing: bool = True,
+) -> Dict[str, Any]:
     """Single tiled key under ``ece_curves/<dataset>``."""
     import wandb as _wandb
 
@@ -389,7 +497,7 @@ def _ece_curves_log_keys(name: str, curve_images: Dict[str, Any]) -> Dict[str, A
     prefix = "ece_curves"
     ordered = [
         caption
-        for caption in ECE_CURVES_PANEL_VARIANTS
+        for caption in panel_variants
         if curve_images.get(caption) and Path(curve_images[caption]).exists()
     ]
     if ordered:
@@ -398,10 +506,10 @@ def _ece_curves_log_keys(name: str, curve_images: Dict[str, Any]) -> Dict[str, A
         ]
     tile = _render_image_tile(
         image_map=curve_images,
-        ordered_captions=list(ECE_CURVES_PANEL_VARIANTS),
+        ordered_captions=list(panel_variants),
         output_path=(Path("/tmp") / f"ece_curves_{name}_all_metrics.png"),
         title=f"ece_curves/{name}",
-        show_missing=True,
+        show_missing=show_missing,
     )
     if tile and tile.exists():
         payload[f"{prefix}/{name}"] = _wandb.Image(str(tile), caption="all_metrics")

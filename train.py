@@ -10,39 +10,16 @@ from configs.parser import build_config
 from data.GSVCitiesDataloader import GSVCitiesDataModule
 from losses.losses import get_loss, get_miner
 from losses.vmf_place_loss import place_centroid_targets
+from models.model_mode import _encode_inputs, build_model_mode
 from utils.runtime import init_model
 from utils.mixvpr_train_wandb import attach_wandb_callback
 # from utils.mixvpr_val_ece import attach_val_ece_callback  # old: second FAISS + ECE callback
 from utils.mixvpr_eval import run_mixvpr_lightning_val_eval, run_mixvpr_validation_eval
 from utils import wandb_utils
+from utils.early_stop_utils import resolve_lightning_ckpt_monitor
 # from validation import get_validation_recalls  # old: Lightning-only recall (PrettyTable)
 
 logger = logging.getLogger(__name__)
-
-
-def _resolve_ckpt_monitor(cfg: dict) -> str:
-    """ModelCheckpoint monitor must match a metric logged during validation."""
-    monitor = str(cfg.get("mixvpr_ckpt_monitor", "pitts30k_val/R1"))
-    val_sets = cfg.get("mixvpr_val_sets") or []
-    if isinstance(val_sets, str):
-        val_sets = [s.strip() for s in val_sets.split(",") if s.strip()]
-    else:
-        val_sets = list(val_sets)
-    if not val_sets:
-        return monitor
-    if "/" in monitor:
-        prefix = monitor.split("/", 1)[0]
-        if prefix in val_sets:
-            return monitor
-    resolved = f"{val_sets[0]}/R1"
-    if monitor != resolved:
-        logger.warning(
-            "mixvpr_ckpt_monitor=%r not in mixvpr_val_sets %s; using %r",
-            monitor,
-            val_sets,
-            resolved,
-        )
-    return resolved
 
 
 class VPRModel(pl.LightningModule):
@@ -86,7 +63,10 @@ class VPRModel(pl.LightningModule):
         self.miner = get_miner(miner_name, self.miner_margin) if miner_name else None
         self.batch_acc = []
 
-        self.core = core
+        for name, child in core.named_children():
+            self.add_module(name, child)
+        self._var_from_feature_map = core._var_from_feature_map
+        self._uses_mixvpr = core._uses_mixvpr
         self._eval_cfg = cfg
         self._wandb_cb = None
 
@@ -106,8 +86,13 @@ class VPRModel(pl.LightningModule):
             logger.info("BatchNorm2d layers frozen (freeze_batchnorm)")
 
     def forward(self, x):
-        descriptors, variances = self.core(x)
-        return descriptors, variances
+        feat, desc = _encode_inputs(self, x)
+        mu = self.final_l2(desc)
+        if self._var_from_feature_map:
+            variance = self.var_head(feat)
+        else:
+            variance = self.var_head(desc)
+        return mu, variance + 1e-6
 
     def configure_optimizers(self):
         trainable = [p for p in self.parameters() if p.requires_grad]
@@ -205,8 +190,6 @@ class VPRModel(pl.LightningModule):
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         images, _ = batch
         descriptors, variances = self(images)
-        if self._wandb_cb is not None:
-            self._wandb_cb.record_val_batch(variances)
         out = descriptors.detach().cpu()
         dl_idx = 0 if dataloader_idx is None else int(dataloader_idx)
         self._val_feats_by_dl.setdefault(dl_idx, []).append(out)
@@ -216,6 +199,8 @@ class VPRModel(pl.LightningModule):
     def on_validation_epoch_end(self):
         """Same metrics as eval.py: one FAISS pass + PrettyTable recall on stdout."""
         run_mixvpr_lightning_val_eval(self, self._eval_cfg)
+        if self._wandb_cb is not None:
+            self._wandb_cb.log_val_ece_wandb(self.trainer, self)
 
         # --- old Lightning validation (get_validation_recalls + MixVPRValEceCallback) ---
         # dm = self.trainer.datamodule
@@ -261,6 +246,13 @@ class VPRModel(pl.LightningModule):
 #         if name.endswith("/R1") or name.endswith("/R5") or name.endswith("/R10"):
 #             out[name] = float(value.detach().cpu()) if torch.is_tensor(value) else float(value)
 #     return out
+
+
+def _eval_model_from_state(pl_module: VPRModel) -> torch.nn.Module:
+    """Rebuild eval ``Uncertainty`` from Lightning ``state_dict`` (same flat keys)."""
+    eval_model = build_model_mode(pl_module._eval_cfg)
+    eval_model.load_state_dict(pl_module.state_dict(), strict=False)
+    return eval_model
 
 
 def _print_recall_comparison(before: dict, after: dict) -> None:
@@ -315,18 +307,25 @@ if __name__ == "__main__":
     # attach_val_ece_callback(cfg, callbacks)  # old: duplicate FAISS for ECE only
 
     if not cfg.get("no_checkpoint"):
-        ckpt_monitor = _resolve_ckpt_monitor(cfg)
+        ckpt_monitor, ckpt_mode, ckpt_tag = resolve_lightning_ckpt_monitor(cfg)
+        logger.info(
+            "ModelCheckpoint monitor=%r mode=%s (from early_stop_metrics=%s)",
+            ckpt_monitor,
+            ckpt_mode,
+            cfg.get("early_stop_metrics"),
+        )
         callbacks.append(
             ModelCheckpoint(
                 monitor=ckpt_monitor,
                 filename=(
                     f"{model.encoder_arch}"
-                    + f"_epoch({{epoch:02d}})_step({{step:04d}})_R1[{{{ckpt_monitor}:.4f}}]"
+                    + f"_epoch({{epoch:02d}})_step({{step:04d}})_"
+                    + f"{ckpt_tag}[{{{ckpt_monitor}:.4f}}]"
                 ),
                 auto_insert_metric_name=False,
                 save_weights_only=True,
                 save_top_k=cfg["mixvpr_ckpt_save_top_k"],
-                mode="max",
+                mode=ckpt_mode,
             )
         )
 
@@ -362,7 +361,11 @@ if __name__ == "__main__":
         print("\n>>> Validation AFTER training\n")
         # Lightning may leave weights on CPU after fit; eval_dataset moves model back to device.
         recalls_after = run_mixvpr_validation_eval(
-            cfg, model.core, device, wandb_step=cfg.get("epochs_num", 0), use_descriptor_cache=False
+            cfg,
+            _eval_model_from_state(model),
+            device,
+            wandb_step=cfg.get("epochs_num", 0),
+            use_descriptor_cache=False,
         )
         _print_recall_comparison(recalls_before, recalls_after)
 

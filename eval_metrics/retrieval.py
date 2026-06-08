@@ -58,6 +58,9 @@ def run_retrieval(
         predictions = predictions[:, :max_recall_k]
         distances = distances[:, :max_recall_k]
 
+    # FAISS returns float32; keep float64 for downstream baselines (SUE exp weights).
+    distances = np.asarray(distances, dtype=np.float64)
+
     return predictions, distances, recalls, recalls_str, positives_per_query, map_at_k
 
 

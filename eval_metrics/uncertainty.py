@@ -125,6 +125,7 @@ def compute_uncertainty_statistics(all_variances, output_dir=None, num_database=
             "q_std": q_stats["std"],
             "q_min": q_stats["min"],
             "q_max": q_stats["max"],
+            "q_median": q_stats["median"],
         })
     else:
         vector_stats = compute_variance_summary(mean_per_vector)
@@ -133,6 +134,7 @@ def compute_uncertainty_statistics(all_variances, output_dir=None, num_database=
             "std": vector_stats["std"],
             "min": vector_stats["min"],
             "max": vector_stats["max"],
+            "median": vector_stats["median"],
         })
     
     return stats

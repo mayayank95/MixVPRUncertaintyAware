@@ -1,30 +1,139 @@
-"""W&B inspection for MixVPR Lightning training (losses + variance stats)."""
+"""W&B panels for MixVPR Lightning training (train / val / ece), updated each epoch."""
 from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 import numpy as np
 import pytorch_lightning as pl
 import torch
 
-from eval_metrics.uncertainty import compute_variance_summary, plot_variance_distribution
+from eval_metrics.eval_wandb import build_training_val_ece_wandb_payload
+from eval_metrics.uncertainty import compute_variance_summary
 from utils import wandb_utils
+
+if TYPE_CHECKING:
+    from eval_metrics.dataset_eval import EvalDatasetResult
 
 logger = logging.getLogger(__name__)
 
 
-class MixVPRTrainWandbCallback(pl.Callback):
-    """
-    Epoch-level W&B logging for train.py (inspired by train_exp.py + wandb_utils.log_train_epoch).
+class MixVPRValEvalBundle:
+    """One validation set result from ``run_mixvpr_lightning_val_eval``."""
 
-    Tracks per epoch:
-      - train/loss, train/loss_uncertainty, train/loss_basic (when applicable)
-      - train/variance_{min,max,mean,std}
-      - val/recall@k from Lightning callback_metrics
-      - val/variance_* + variance distribution plot (when model outputs variances)
-    """
+    __slots__ = ("val_set_name", "result", "output_dir")
+
+    def __init__(
+        self,
+        val_set_name: str,
+        result: "EvalDatasetResult",
+        output_dir: Optional[Path],
+    ):
+        self.val_set_name = val_set_name
+        self.result = result
+        self.output_dir = output_dir
+
+
+def build_train_panel_metrics(
+    active_losses: List[str],
+    epoch_losses: List[float],
+    epoch_losses_basic: List[float],
+    epoch_losses_uncertainty: List[float],
+    epoch_variances: List[float],
+) -> Dict[str, Any]:
+    """Scalars for the ``train/`` W&B panel (mirrors ``val/`` variance stats, no plot)."""
+    metrics: Dict[str, Any] = {}
+    n_losses = len([x for x in active_losses if x in ("basic", "uncertainty")])
+
+    if epoch_losses:
+        metrics["train/loss"] = float(np.mean(epoch_losses))
+    if n_losses > 1 and epoch_losses:
+        metrics["train/loss_total"] = float(np.mean(epoch_losses))
+    if epoch_losses_basic:
+        metrics["train/loss_basic"] = float(np.mean(epoch_losses_basic))
+    if epoch_losses_uncertainty:
+        metrics["train/loss_uncertainty"] = float(np.mean(epoch_losses_uncertainty))
+
+    if epoch_variances:
+        vs = compute_variance_summary(np.asarray(epoch_variances, dtype=np.float64))
+        metrics["train/variances_min"] = vs["min"]
+        metrics["train/variances_max"] = vs["max"]
+        metrics["train/variances_mean"] = vs["mean"]
+        metrics["train/variances_std"] = vs["std"]
+        metrics["train/variances_median"] = vs["median"]
+    return metrics
+
+
+def log_mixvpr_training_epoch_wandb(
+    cfg: Dict[str, Any],
+    step: int,
+    train_metrics: Dict[str, Any],
+    val_eval: Optional[MixVPRValEvalBundle],
+    *,
+    val_variance_median: Optional[float] = None,
+) -> None:
+    """Log train + val + ece panels at ``step`` (one ``wandb.log`` per epoch)."""
+    if not cfg.get("use_wandb"):
+        return
+
+    payload: Dict[str, Any] = {"epoch": step}
+    payload.update(train_metrics)
+
+    if val_eval is not None and val_eval.result.panel_data:
+        panel = val_eval.result.panel_data
+        payload.update(
+            build_training_val_ece_wandb_payload(
+                panel,
+                val_eval.result.wandb_images,
+                val_eval.output_dir,
+                cfg,
+            )
+        )
+        if val_variance_median is not None and "val/variances_median" not in payload:
+            payload["val/variances_median"] = float(val_variance_median)
+
+    if len(payload) > 1:
+        wandb_utils.log_wandb(payload, step=step)
+
+
+def log_mixvpr_train_panel_wandb(cfg: Dict[str, Any], step: int, train_metrics: Dict[str, Any]) -> None:
+    """Log ``train/`` scalars at end of each training epoch."""
+    if not cfg.get("use_wandb") or not train_metrics:
+        return
+    wandb_utils.log_wandb({"epoch": step, **train_metrics}, step=step)
+
+
+def log_mixvpr_val_ece_panel_wandb(
+    cfg: Dict[str, Any],
+    step: int,
+    val_eval: Optional[MixVPRValEvalBundle],
+) -> None:
+    """Log ``val/`` + ``ece/`` after validation eval (call from ``VPRModel`` hook)."""
+    if not cfg.get("use_wandb") or val_eval is None or not val_eval.result.panel_data:
+        return
+
+    panel = val_eval.result.panel_data
+    payload: Dict[str, Any] = {"epoch": step}
+    payload.update(
+        build_training_val_ece_wandb_payload(
+            panel,
+            val_eval.result.wandb_images,
+            val_eval.output_dir,
+            cfg,
+        )
+    )
+    stats = panel.get("variance_stat") or {}
+    qmed = stats.get("q_median", stats.get("median"))
+    if isinstance(qmed, (int, float)) and "val/variances_median" not in payload:
+        payload["val/variances_median"] = float(qmed)
+
+    if len(payload) > 1:
+        wandb_utils.log_wandb(payload, step=step)
+
+
+class MixVPRTrainWandbCallback(pl.Callback):
+    """Epoch-level W&B: train/, val/, ece/ panels (val/ece from eval.py path)."""
 
     def __init__(self, cfg: Dict[str, Any]):
         super().__init__()
@@ -37,9 +146,7 @@ class MixVPRTrainWandbCallback(pl.Callback):
         self.epoch_losses_basic: List[float] = []
         self.epoch_losses_uncertainty: List[float] = []
         self.epoch_variances: List[float] = []
-
-        self.val_variance_vectors: List[np.ndarray] = []
-        self.best_val_r1 = 0.0
+        self._cached_train_metrics: Dict[str, Any] = {}
 
     def _enabled(self) -> bool:
         return bool(self.cfg.get("use_wandb"))
@@ -49,6 +156,7 @@ class MixVPRTrainWandbCallback(pl.Callback):
         self.epoch_losses_basic = []
         self.epoch_losses_uncertainty = []
         self.epoch_variances = []
+        self._cached_train_metrics = {}
 
     def record_train_batch(
         self,
@@ -60,154 +168,87 @@ class MixVPRTrainWandbCallback(pl.Callback):
     ) -> None:
         if not self._enabled():
             return
-        self.epoch_losses.append(float(loss.detach().item()))
+        basic_v, unc_v = self._batch_loss_parts(pl_module, descriptors, labels, variances)
+        self._append_loss_batch(
+            float(loss.detach().item()),
+            basic_v,
+            unc_v,
+            variances,
+        )
+
+    def _batch_loss_parts(
+        self,
+        pl_module: pl.LightningModule,
+        descriptors: torch.Tensor,
+        labels: torch.Tensor,
+        variances: Optional[torch.Tensor],
+    ) -> tuple[Optional[float], Optional[float]]:
+        basic_v = None
+        unc_v = None
 
         if "basic" in self.active_losses and pl_module.loss_basic is not None:
-            with torch.no_grad():
-                if pl_module.miner is not None:
-                    miner_out = pl_module.miner(descriptors, labels)
-                    l_basic = pl_module.loss_basic(descriptors, labels, miner_out)
-                else:
-                    l_basic = pl_module.loss_basic(descriptors, labels)
-                if isinstance(l_basic, tuple):
-                    l_basic = l_basic[0]
-                self.epoch_losses_basic.append(float(l_basic.item()))
+            if pl_module.miner is not None:
+                miner_out = pl_module.miner(descriptors, labels)
+                l_basic = pl_module.loss_basic(descriptors, labels, miner_out)
+            else:
+                l_basic = pl_module.loss_basic(descriptors, labels)
+            if isinstance(l_basic, tuple):
+                l_basic = l_basic[0]
+            basic_v = float(l_basic.item())
 
         if "uncertainty" in self.active_losses and variances is not None:
-            with torch.no_grad():
-                l_unc = pl_module._uncertainty_loss(descriptors, labels, variances)
-                self.epoch_losses_uncertainty.append(float(l_unc.item()))
+            unc_v = float(pl_module._uncertainty_loss(descriptors, labels, variances).item())
+
+        return basic_v, unc_v
+
+    def _append_loss_batch(
+        self,
+        total_loss: float,
+        basic_v: Optional[float],
+        unc_v: Optional[float],
+        variances: Optional[torch.Tensor],
+    ) -> None:
+        self.epoch_losses.append(total_loss)
+        if basic_v is not None:
+            self.epoch_losses_basic.append(basic_v)
+        if unc_v is not None:
+            self.epoch_losses_uncertainty.append(unc_v)
+        if variances is not None:
             per_sample = variances.detach().float().mean(dim=-1).cpu().numpy()
             self.epoch_variances.extend(per_sample.reshape(-1).tolist())
 
-    def record_val_batch(self, variances: Optional[torch.Tensor]) -> None:
-        if not self._enabled() or variances is None:
-            return
-        self.val_variance_vectors.append(
-            variances.detach().float().cpu().numpy()
-        )
-
     def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        if not self._enabled() or not self.epoch_losses:
+        if not self._enabled():
             return
-        step = trainer.current_epoch
-        metrics: Dict[str, Any] = {"epoch": step}
-        metrics["train/loss"] = float(np.mean(self.epoch_losses))
-        if self.epoch_losses_basic:
-            metrics["train/loss_basic"] = float(np.mean(self.epoch_losses_basic))
-        if self.epoch_losses_uncertainty:
-            metrics["train/loss_uncertainty"] = float(np.mean(self.epoch_losses_uncertainty))
-        if self.epoch_variances:
-            vs = compute_variance_summary(np.asarray(self.epoch_variances, dtype=np.float64))
-            metrics["train/variance_mean"] = vs["mean"]
-            metrics["train/variance_std"] = vs["std"]
-            metrics["train/variance_min"] = vs["min"]
-            metrics["train/variance_max"] = vs["max"]
-            metrics["train/variance_median"] = vs["median"]
-        wandb_utils.log_wandb(metrics, step=step)
+        self._cached_train_metrics = build_train_panel_metrics(
+            self.active_losses,
+            self.epoch_losses,
+            self.epoch_losses_basic,
+            self.epoch_losses_uncertainty,
+            self.epoch_variances,
+        )
+        log_mixvpr_train_panel_wandb(self.cfg, trainer.current_epoch, self._cached_train_metrics)
 
-    def on_validation_epoch_start(
-        self, trainer: pl.Trainer, pl_module: pl.LightningModule
-    ) -> None:
-        self.val_variance_vectors = []
-
-    def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+    def log_val_ece_wandb(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        """Call from ``VPRModel.on_validation_epoch_end`` after ``run_mixvpr_lightning_val_eval``."""
         if not self._enabled():
             return
 
         step = trainer.current_epoch
-        cm = {
-            k: float(v.detach().cpu()) if torch.is_tensor(v) else float(v)
-            for k, v in trainer.callback_metrics.items()
-        }
+        bundles: List[MixVPRValEvalBundle] = getattr(pl_module, "_mixvpr_val_eval_bundles", []) or []
+        primary = bundles[0] if bundles else None
 
-        recalls, val_set = _extract_val_recalls(cm, self.cfg.get("mixvpr_ckpt_monitor", "pitts30k_val/R1"))
-        if recalls is not None and len(recalls) > 0:
-            self.best_val_r1 = max(self.best_val_r1, float(recalls[0]))
-
-        eval_wandb_metrics: Dict[str, Any] = {}
-        for k, v in cm.items():
-            if "/R" in k or k.startswith("val/"):
-                eval_wandb_metrics[k] = v
-
-        mean_q_var = std_q_var = min_q_var = max_q_var = None
-        wandb_images: Optional[Dict[str, Path]] = None
-        if self.val_variance_vectors:
-            all_var = np.concatenate(self.val_variance_vectors, axis=0)
-            vs = compute_variance_summary(all_var.reshape(all_var.shape[0], -1).mean(axis=1))
-            mean_q_var = vs["mean"]
-            std_q_var = vs["std"]
-            min_q_var = vs["min"]
-            max_q_var = vs["max"]
-            log_dir = self.cfg.get("log_dir")
-            if log_dir:
-                out_dir = Path(log_dir) / "wandb_inspect" / f"epoch_{step:03d}"
-                out_dir.mkdir(parents=True, exist_ok=True)
-                plot_variance_distribution(all_var, out_dir)
-                plot_path = out_dir / "variance_distribution.png"
-                if plot_path.exists():
-                    wandb_images = {"variance_distribution": plot_path.resolve()}
-
-        recalls_arr = recalls if recalls is not None else np.array([0.0])
-        wandb_utils.log_train_epoch(
-            self.cfg,
-            step,
-            recalls_arr,
-            map_at_k=None,
-            best_val_recall1=self.best_val_r1,
-            active_losses=self.active_losses,
-            epoch_variances=self.epoch_variances if self.epoch_variances else None,
-            epoch_losses=self.epoch_losses,
-            epoch_losses_ce=self.epoch_losses_basic if self.epoch_losses_basic else None,
-            epoch_losses_gnll=self.epoch_losses_uncertainty
-            if self.epoch_losses_uncertainty
-            else None,
-            mean_query_variance=mean_q_var,
-            std_query_variance=std_q_var,
-            min_query_variance=min_q_var,
-            max_query_variance=max_q_var,
-            eval_wandb_metrics=eval_wandb_metrics,
-            eval_wandb_images=wandb_images,
-        )
-        if val_set:
+        if primary and primary.result.panel_data:
+            recalls = primary.result.recalls
+            r1 = float(recalls[0]) if len(recalls) else 0.0
             logger.info(
-                "W&B val epoch %s: %s R@1=%.4f variance_mean=%s",
+                "W&B val epoch %s: %s R@1=%.4f",
                 step,
-                val_set,
-                float(recalls_arr[0]) if len(recalls_arr) else 0.0,
-                f"{mean_q_var:.4f}" if mean_q_var is not None else "n/a",
+                primary.val_set_name,
+                r1,
             )
 
-
-def _extract_val_recalls(
-    callback_metrics: Dict[str, float], ckpt_monitor: str
-) -> tuple[Optional[np.ndarray], Optional[str]]:
-    """Build recall@k array from Lightning logs (pitts30k_val/R1, ...)."""
-    val_set = ckpt_monitor.split("/")[0] if "/" in ckpt_monitor else None
-    if val_set and f"{val_set}/R1" in callback_metrics:
-        k_values = [1, 5, 10, 15, 20, 50, 100]
-        recalls = []
-        for k in k_values:
-            key = f"{val_set}/R{k}"
-            if key not in callback_metrics:
-                break
-            recalls.append(callback_metrics[key])
-        if recalls:
-            return np.asarray(recalls, dtype=np.float64), val_set
-
-    for key in sorted(callback_metrics):
-        if key.endswith("/R1"):
-            val_set = key.rsplit("/", 1)[0]
-            k_values = [1, 5, 10, 15, 20, 50, 100]
-            recalls = []
-            for k in k_values:
-                rk = f"{val_set}/R{k}"
-                if rk not in callback_metrics:
-                    break
-                recalls.append(callback_metrics[rk])
-            if recalls:
-                return np.asarray(recalls, dtype=np.float64), val_set
-    return None, None
+        log_mixvpr_val_ece_panel_wandb(self.cfg, step, primary)
 
 
 def attach_wandb_callback(cfg: Dict[str, Any], callbacks: List[pl.Callback]) -> Optional[MixVPRTrainWandbCallback]:

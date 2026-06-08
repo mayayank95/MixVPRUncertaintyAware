@@ -18,7 +18,14 @@ def _load_weights(
     If skip_var_head is True, do not load var_head keys (keep build-time init, e.g. var_init)."""
     logger.info("Loading model weights from %s", checkpoint_path)
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    state_dict = checkpoint.get(state_dict_key, checkpoint)
+    if state_dict_key in checkpoint and isinstance(checkpoint[state_dict_key], dict):
+        state_dict = checkpoint[state_dict_key]
+    elif "state_dict" in checkpoint and isinstance(checkpoint["state_dict"], dict):
+        state_dict = checkpoint["state_dict"]
+    else:
+        state_dict = checkpoint
+    if any(k.startswith("core.") for k in state_dict):
+        state_dict = {k[len("core.") :]: v for k, v in state_dict.items() if k.startswith("core.")}
     if skip_var_head:
         n_before = len(state_dict)
         state_dict = {k: v for k, v in state_dict.items() if "var_head" not in k}

@@ -452,7 +452,8 @@ def setup_logging(logs_folder: Optional[str], dry_run: bool = False,
     When use_wandb is True, create log_dir even in dry_run so W&B and eval paths (eval/dataset_name) work."""
     handlers = []
 
-    console_handler = logging.StreamHandler(sys.stdout)
+    # stderr keeps tqdm progress bars on stdout from printing a new line per refresh
+    console_handler = logging.StreamHandler(sys.stderr)
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s: %(message)s", "%H:%M:%S"))
     handlers.append(console_handler)

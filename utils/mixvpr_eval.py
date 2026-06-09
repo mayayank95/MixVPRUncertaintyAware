@@ -96,9 +96,8 @@ def log_mixvpr_eval_result(
     panel = result.panel_data or {}
     train_metrics = panel_to_train_val_metrics(val_set_name, panel)
 
-    if pl_module is not None:
-        for k, v in train_metrics.items():
-            pl_module.log(k, v, prog_bar=False, logger=True, on_epoch=True)
+    if pl_module is not None and train_metrics:
+        pl_module.log_dict(train_metrics, prog_bar=False, logger=True, on_epoch=True)
 
     if cfg.get("use_wandb") and panel and log_wandb:
         step = wandb_step if wandb_step is not None else 0

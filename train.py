@@ -3,7 +3,7 @@ import sys
 
 import pytorch_lightning as pl
 import torch
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
 from torch.optim import lr_scheduler
 
 from configs.parser import build_config
@@ -298,7 +298,9 @@ if __name__ == "__main__":
         positive_dist_threshold=cfg["positive_dist_threshold"],
     )
 
-    callbacks = []
+    callbacks = [
+        TQDMProgressBar(refresh_rate=max(1, int(cfg["log_every_n_steps"]))),
+    ]
     wandb_cb = attach_wandb_callback(cfg, callbacks)
 
     model = VPRModel(cfg, core=core)

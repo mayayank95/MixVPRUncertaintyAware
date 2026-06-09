@@ -33,6 +33,24 @@ def _stable_var_init(module, activation="softplus", target_variance=0.1):
                 nn.init.constant_(m.bias, bias_val)
 
 
+def _make_var_head_cls(use_agg: bool, linear_kind: str, act_name: str):
+    """Subclass with a descriptive __name__ for Lightning model summaries."""
+    agg_tag = "agg" if use_agg else "noagg"
+    type_name = f"VarHead({agg_tag}, lin={linear_kind}, {act_name})"
+
+    class VarHead(nn.Module):
+        def __init__(self, layers):
+            super().__init__()
+            self.seq = nn.Sequential(*layers)
+
+        def forward(self, x):
+            return self.seq(x)
+
+    VarHead.__name__ = type_name
+    VarHead.__qualname__ = type_name
+    return VarHead
+
+
 def _build_var_head(opt, fc_output_dim, aggregation=None):
     """Build the variance head from orthogonal flags."""
     use_agg = bool(opt.get("var_head_agg", False))
@@ -55,7 +73,7 @@ def _build_var_head(opt, fc_output_dim, aggregation=None):
         )
 
     layers.append(activation)
-    head = nn.Sequential(*layers)
+    head = _make_var_head_cls(use_agg, linear_kind, act_name)(layers)
 
     if opt.get("var_init"):
         _stable_var_init(head, act_name)

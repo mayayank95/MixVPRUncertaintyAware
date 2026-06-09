@@ -369,9 +369,7 @@ if __name__ == "__main__":
         log_every_n_steps=cfg["log_every_n_steps"],
     )
 
-    datamodule.setup("fit")
-    recalls_before = None
-    if cfg.get("validate_before_fit") or cfg.get("freeze_model"):
+    if cfg.get("validate_before_fit"):
         print("\n>>> Validation BEFORE training\n")
         # trainer.validate(model=model, datamodule=datamodule)
         # recalls_before = _collect_recall_metrics(trainer)
@@ -382,7 +380,7 @@ if __name__ == "__main__":
     model._set_train_mode()
     trainer.fit(model=model, datamodule=datamodule)
 
-    if cfg.get("freeze_model") and recalls_before is not None:
+    if cfg.get("validate_before_fit") and recalls_before is not None:
         print("\n>>> Validation AFTER training\n")
         # Lightning may leave weights on CPU after fit; eval_dataset moves model back to device.
         recalls_after = run_mixvpr_validation_eval(

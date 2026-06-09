@@ -6,6 +6,8 @@ import torch
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
 from torch.optim import lr_scheduler
 
+import numpy as np
+
 from configs.parser import build_config
 from data.GSVCitiesDataloader import GSVCitiesDataModule
 from losses.losses import get_loss, get_miner
@@ -62,6 +64,7 @@ class VPRModel(pl.LightningModule):
         )
         self.miner = get_miner(miner_name, self.miner_margin) if miner_name else None
         self.batch_acc = []
+        self._epoch_variances = []
 
         for name, child in core.named_children():
             self.add_module(name, child)
@@ -159,10 +162,8 @@ class VPRModel(pl.LightningModule):
             if self.loss_uncertainty is not None and variances is not None:
                 loss = loss + self._uncertainty_loss(descriptors, labels, variances)
 
-        self.batch_acc.append(batch_acc)
-        self.log(
-            "b_acc", sum(self.batch_acc) / len(self.batch_acc), prog_bar=True, logger=True
-        )
+        if not self.freeze_base and (self.miner is not None or self.loss_basic is not None):
+            self.batch_acc.append(batch_acc)
         return loss
 
     def training_step(self, batch, batch_idx):
@@ -174,6 +175,10 @@ class VPRModel(pl.LightningModule):
         descriptors, variances = self(images)
         loss = self.loss_function(descriptors, labels, variances)
 
+        if variances is not None:
+            per_sample = variances.detach().float().mean(dim=-1).cpu()
+            self._epoch_variances.extend(per_sample.tolist())
+
         if self._wandb_cb is not None:
             self._wandb_cb.record_train_batch(self, loss, variances, descriptors, labels)
 
@@ -181,6 +186,24 @@ class VPRModel(pl.LightningModule):
         return {"loss": loss}
 
     def on_train_epoch_end(self):
+        if self.freeze_base and self._epoch_variances:
+            median = float(np.median(self._epoch_variances))
+            self.log(
+                "variances_median",
+                median,
+                prog_bar=True,
+                logger=True,
+                on_epoch=True,
+            )
+        elif not self.freeze_base and self.batch_acc:
+            self.log(
+                "b_acc",
+                sum(self.batch_acc) / len(self.batch_acc),
+                prog_bar=True,
+                logger=True,
+                on_epoch=True,
+            )
+        self._epoch_variances = []
         self.batch_acc = []
 
     def on_validation_epoch_start(self):

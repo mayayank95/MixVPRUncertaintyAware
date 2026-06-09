@@ -109,7 +109,7 @@ def log_mixvpr_val_ece_panel_wandb(
     step: int,
     val_eval: Optional[MixVPRValEvalBundle],
 ) -> None:
-    """Log ``val/`` + ``ece/`` after validation eval (call from ``VPRModel`` hook)."""
+    """Log ``val/`` + ``ece/`` + ``ece_curves/`` + ``bins_distribution/`` after validation eval."""
     if not cfg.get("use_wandb") or val_eval is None or not val_eval.result.panel_data:
         return
 
@@ -133,7 +133,7 @@ def log_mixvpr_val_ece_panel_wandb(
 
 
 class MixVPRTrainWandbCallback(pl.Callback):
-    """Epoch-level W&B: train/, val/, ece/ panels (val/ece from eval.py path)."""
+    """Epoch-level W&B: train/, val/, ece/, ece_curves/, bins_distribution/ panels."""
 
     def __init__(self, cfg: Dict[str, Any]):
         super().__init__()

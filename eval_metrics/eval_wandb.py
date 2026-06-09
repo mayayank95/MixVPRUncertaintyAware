@@ -352,7 +352,7 @@ def build_training_val_ece_wandb_payload(
     dataset_output_dir: Optional[Path],
     cfg: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """W&B ``val/`` + ``ece/`` + ``ece_curves/`` panels from one eval ``panel_data`` (train loop)."""
+    """W&B ``val/`` + ``ece/`` + ``ece_curves/`` + ``bins_distribution/`` panels (train loop)."""
     import wandb as _wandb
 
     payload: Dict[str, Any] = {}
@@ -402,6 +402,8 @@ def build_training_val_ece_wandb_payload(
             show_missing=False,
         )
     )
+    bins_images = collect_bins_distribution_images(dataset_output_dir)
+    payload.update(_bins_distribution_log_keys(dataset_name, bins_images))
 
     if wandb_images:
         prefix = f"Eval_{dataset_name}/"

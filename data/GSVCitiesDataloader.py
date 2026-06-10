@@ -1,3 +1,6 @@
+import multiprocessing as mp
+from typing import Any, Dict
+
 import pytorch_lightning as pl
 from torch.utils.data.dataloader import DataLoader
 from torchvision import transforms as T
@@ -14,6 +17,33 @@ TRAIN_CITIES = [
     "Lisbon", "Medellin", "Minneapolis", "PRG", "WashingtonDC", "Brussels",
     "London", "Melbourne", "Osaka", "PRS",
 ]
+
+SF_XL_CITIES = [
+    "SF3770", "SF3771", "SF3772", "SF3773", "SF3774", "SF3775",
+    "SF3776", "SF3777", "SF3778", "SF3779", "SF3780", "SF3781",
+]
+
+
+def _safe_dataloader_kwargs(
+    *,
+    batch_size: int,
+    num_workers: int,
+    shuffle: bool,
+    drop_last: bool = False,
+) -> Dict[str, Any]:
+    """DataLoader kwargs that avoid fork-after-CUDA worker crashes."""
+    kwargs: Dict[str, Any] = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "drop_last": drop_last,
+        "shuffle": shuffle,
+        # pin_memory in workers can trigger CUDA init in child processes.
+        "pin_memory": num_workers == 0,
+    }
+    if num_workers > 0:
+        kwargs["persistent_workers"] = True
+        kwargs["multiprocessing_context"] = mp.get_context("spawn")
+    return kwargs
 
 
 class GSVCitiesDataModule(pl.LightningDataModule):
@@ -33,6 +63,8 @@ class GSVCitiesDataModule(pl.LightningDataModule):
         val_set_names=None,
         datasets_config=None,
         positive_dist_threshold=25,
+        base_path=None,
+        sfxl_train_root=None,
     ):
         super().__init__()
         self.batch_size = batch_size
@@ -50,6 +82,8 @@ class GSVCitiesDataModule(pl.LightningDataModule):
         self.val_set_names = val_set_names or ["pitts30k_val", "msls_val"]
         self.datasets_config = datasets_config
         self.positive_dist_threshold = positive_dist_threshold
+        self.base_path = base_path
+        self.sfxl_train_root = sfxl_train_root
         self.save_hyperparameters()
 
         self.train_transform = T.Compose([
@@ -63,20 +97,17 @@ class GSVCitiesDataModule(pl.LightningDataModule):
             T.ToTensor(),
             T.Normalize(mean=self.mean_dataset, std=self.std_dataset),
         ])
-        self.train_loader_config = {
-            "batch_size": self.batch_size,
-            "num_workers": self.num_workers,
-            "drop_last": False,
-            "pin_memory": True,
-            "shuffle": self.shuffle_all,
-        }
-        self.valid_loader_config = {
-            "batch_size": self.batch_size,
-            "num_workers": max(1, self.num_workers // 2),
-            "drop_last": False,
-            "pin_memory": True,
-            "shuffle": False,
-        }
+        val_workers = max(1, self.num_workers // 2) if self.num_workers > 0 else 0
+        self.train_loader_config = _safe_dataloader_kwargs(
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=self.shuffle_all,
+        )
+        self.valid_loader_config = _safe_dataloader_kwargs(
+            batch_size=self.batch_size,
+            num_workers=val_workers,
+            shuffle=False,
+        )
 
     def setup(self, stage):
         if stage == "fit":
@@ -107,12 +138,18 @@ class GSVCitiesDataModule(pl.LightningDataModule):
                 self.print_stats()
 
     def reload(self):
+        kwargs = {}
+        if self.base_path is not None:
+            kwargs["base_path"] = self.base_path
+        if self.sfxl_train_root is not None:
+            kwargs["sfxl_train_root"] = self.sfxl_train_root
         self.train_dataset = GSVCitiesDataset(
             cities=self.cities,
             img_per_place=self.img_per_place,
             min_img_per_place=self.min_img_per_place,
             random_sample_from_each_place=self.random_sample_from_each_place,
             transform=self.train_transform,
+            **kwargs,
         )
 
     def train_dataloader(self):
@@ -131,7 +168,7 @@ class GSVCitiesDataModule(pl.LightningDataModule):
         table.align["Data"] = "l"
         table.align["Value"] = "l"
         table.header = False
-        table.add_row(["# of cities", f"{len(TRAIN_CITIES)}"])
+        table.add_row(["# of cities", f"{len(self.cities)}"])
         table.add_row(["# of places", f"{self.train_dataset.__len__()}"])
         table.add_row(["# of images", f"{self.train_dataset.total_nb_images}"])
         print(table.get_string(title="Training Dataset"))

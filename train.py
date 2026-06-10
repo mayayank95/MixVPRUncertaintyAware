@@ -3,13 +3,14 @@ import sys
 
 import pytorch_lightning as pl
 import torch
+import torch.multiprocessing as mp
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
 from torch.optim import lr_scheduler
 
 import numpy as np
 
 from configs.parser import build_config
-from data.GSVCitiesDataloader import GSVCitiesDataModule
+from data.GSVCitiesDataloader import GSVCitiesDataModule, TRAIN_CITIES
 from losses.losses import get_loss, get_miner
 from losses.vmf_place_loss import place_centroid_targets
 from models.model_mode import _encode_inputs, build_model_mode
@@ -296,6 +297,11 @@ def _print_recall_comparison(before: dict, after: dict) -> None:
 
 
 if __name__ == "__main__":
+    try:
+        mp.set_start_method("spawn")
+    except RuntimeError:
+        pass
+
     cfg, _entries = build_config()
     logger.info(" ".join(sys.argv))
     if cfg.get("log_dir"):
@@ -307,6 +313,7 @@ if __name__ == "__main__":
     device, core = init_model(cfg)
 
     img_side = int(cfg["image_size"])
+    train_cities = cfg.get("train_cities") or TRAIN_CITIES
     datamodule = GSVCitiesDataModule(
         batch_size=cfg["batch_size"],
         img_per_place=cfg["img_per_place"],
@@ -316,9 +323,12 @@ if __name__ == "__main__":
         image_size=(img_side, img_side),
         num_workers=cfg["num_workers"],
         show_data_stats=True,
+        cities=train_cities,
         val_set_names=list(cfg["mixvpr_val_sets"]),
         datasets_config=cfg["config"],
         positive_dist_threshold=cfg["positive_dist_threshold"],
+        base_path=cfg.get("gsv_base_path"),
+        sfxl_train_root=cfg.get("sfxl_train_root"),
     )
 
     callbacks = [

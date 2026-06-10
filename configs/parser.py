@@ -156,6 +156,25 @@ def parse_args() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
         default=True,
         help="Random image subset per place each epoch",
     )
+    p.add_argument(
+        "--gsv_base_path",
+        type=str,
+        default="/home/shared/datasets/gsv_cities/",
+        help="GSV-style dataset root (Dataframes/ + optional Images/). Use sfxl_gsv output for SF-XL.",
+    )
+    p.add_argument(
+        "--sfxl_train_root",
+        type=str,
+        default=None,
+        help="SF-XL train image root (37.70/, ...). Required when CSV rows use sfxl_rel_path.",
+    )
+    p.add_argument(
+        "--train_cities",
+        type=str,
+        default=None,
+        help='Comma-separated city CSV names (e.g. "SF3770,SF3771" or "London,Boston"). '
+        "Default: 23 GSV TRAIN_CITIES.",
+    )
 
     # MixVPR (train.py) — hyperparameters
     p.add_argument("--mixvpr_optimizer", type=str, default="sgd", choices=["sgd", "adamw", "adam"],
@@ -334,14 +353,16 @@ def normalize(merged: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(merged)
 
     # Paths: store as strings in config, but normalize to expanded string paths
-    for k in ("data_folder", "logs_folder", "resume_train", "resume_model"):
+    for k in ("data_folder", "logs_folder", "resume_train", "resume_model",
+              "gsv_base_path", "sfxl_train_root"):
         if k in out and out[k] is not None:
             out[k] = str(Path(out[k]).expanduser())
 
     if out.get("no_mixvpr_pretrained"):
         out["mixvpr_pretrained"] = False
 
-    for element in ("datasets", "datasets_type", "losses", "mixvpr_val_sets", "mixvpr_train_losses"):
+    for element in ("datasets", "datasets_type", "losses", "mixvpr_val_sets",
+                    "mixvpr_train_losses", "train_cities"):
         if element in out and out[element] is not None:
             v = out[element]
             if isinstance(v, list):

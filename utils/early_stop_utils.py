@@ -5,7 +5,13 @@ from typing import Any, Dict, List, Optional
 
 _ECE_RECALL_ALIAS = {"ece_recall": "ece_recall_01"}
 
-_ALLOWED = frozenset({"recall", "ece_recall_01", "ece_recall_05", "ece_recall_10"})
+_ALLOWED = frozenset({
+    "recall",
+    "ece_recall_01",
+    "ece_recall_05",
+    "ece_recall_10",
+    "ece_ap",
+})
 
 
 def canonical_early_stop_metrics(raw: Any) -> List[str]:
@@ -111,6 +117,8 @@ def lightning_ckpt_metric_name(early_stop_metric: str, val_set_name: str) -> str
     if early_stop_metric.startswith("ece_recall_"):
         k = int(early_stop_metric.rsplit("_", 1)[-1])
         return f"{val_set_name}/ece_kappa_recall_{k:02d}"
+    if early_stop_metric == "ece_ap":
+        return f"{val_set_name}/ece_kappa_ap"
     raise ValueError(f"Unsupported early_stop metric for Lightning checkpoint: {early_stop_metric!r}")
 
 
@@ -120,6 +128,8 @@ def lightning_ckpt_filename_tag(early_stop_metric: str) -> str:
     if early_stop_metric.startswith("ece_recall_"):
         k = int(early_stop_metric.rsplit("_", 1)[-1])
         return f"ece_r{k:02d}"
+    if early_stop_metric == "ece_ap":
+        return "ece_ap"
     return early_stop_metric.replace("/", "_")
 
 
@@ -151,3 +161,29 @@ def resolve_lightning_ckpt_monitor(cfg: dict) -> tuple[str, str, str]:
     mode = "max" if legacy.endswith("/R1") else "min"
     tag = legacy.split("/")[-1].replace("ece_kappa_recall_", "ece_r")
     return legacy, mode, tag
+
+
+def resolve_recall_early_stop_ckpt_spec(cfg: dict) -> tuple[str, str, str, str]:
+    """``(canonical_id, monitor, mode, filename_tag)`` for recall early-stop / checkpoint."""
+    val_set = _first_val_set_name(cfg)
+    return (
+        "recall",
+        lightning_ckpt_metric_name("recall", val_set),
+        "max",
+        lightning_ckpt_filename_tag("recall"),
+    )
+
+
+def resolve_ece_early_stop_ckpt_specs(cfg: dict) -> List[tuple[str, str, str, str]]:
+    """``(canonical_id, monitor, mode, filename_tag)`` for each ECE early-stop metric."""
+    val_set = _first_val_set_name(cfg)
+    specs: List[tuple[str, str, str, str]] = []
+    for metric in cfg.get("early_stop_metrics") or []:
+        if metric.startswith("ece_recall_") or metric == "ece_ap":
+            specs.append((
+                metric,
+                lightning_ckpt_metric_name(metric, val_set),
+                "min",
+                lightning_ckpt_filename_tag(metric),
+            ))
+    return specs

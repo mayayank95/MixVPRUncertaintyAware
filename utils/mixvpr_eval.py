@@ -57,7 +57,7 @@ def _val_set_names(cfg: Dict[str, Any]) -> List[str]:
 def mixvpr_val_num_references(val_set_name: str, val_dataset) -> int:
     if "pitts" in val_set_name:
         return int(val_dataset.dbStruct.numDb)
-    if "msls" in val_set_name:
+    if "msls" in val_set_name or "sf_xl" in val_set_name:
         return int(val_dataset.num_references)
     raise NotImplementedError(f"Unknown validation set: {val_set_name}")
 

@@ -1,10 +1,11 @@
 import logging
 import sys
+from pathlib import Path
 
 import pytorch_lightning as pl
 import torch
 import torch.multiprocessing as mp
-from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint, TQDMProgressBar
 from torch.optim import lr_scheduler
 
 import numpy as np
@@ -19,7 +20,16 @@ from utils.mixvpr_train_wandb import attach_wandb_callback
 # from utils.mixvpr_val_ece import attach_val_ece_callback  # old: second FAISS + ECE callback
 from utils.mixvpr_eval import run_mixvpr_lightning_val_eval, run_mixvpr_validation_eval
 from utils import wandb_utils
-from utils.early_stop_utils import resolve_lightning_ckpt_monitor
+from utils.early_stop_utils import (
+    resolve_ece_early_stop_ckpt_specs,
+    resolve_lightning_ckpt_monitor,
+    resolve_recall_early_stop_ckpt_spec,
+)
+from utils.mixvpr_early_stop import (
+    FrozenModelCheckpoint,
+    MultiMetricEarlyStop,
+    PhasedMultiMetricEarlyStop,
+)
 # from validation import get_validation_recalls  # old: Lightning-only recall (PrettyTable)
 
 logger = logging.getLogger(__name__)
@@ -341,16 +351,146 @@ if __name__ == "__main__":
         model._wandb_cb = wandb_cb
     # attach_val_ece_callback(cfg, callbacks)  # old: duplicate FAISS for ECE only
 
-    if not cfg.get("no_checkpoint"):
+    ece_ckpt_specs = resolve_ece_early_stop_ckpt_specs(cfg)
+    phased_early_stop = bool(cfg.get("phased_early_stop")) and bool(ece_ckpt_specs)
+    multi_ece_early_stop = len(ece_ckpt_specs) >= 2
+    need_ckpt_monitor = not cfg.get("no_checkpoint") or not cfg.get("disable_early_stop")
+    if need_ckpt_monitor and not multi_ece_early_stop and not phased_early_stop:
         ckpt_monitor, ckpt_mode, ckpt_tag = resolve_lightning_ckpt_monitor(cfg)
+    else:
+        ckpt_monitor = ckpt_mode = ckpt_tag = None
+
+    patience = int(cfg.get("patience", 15))
+    ece_ckpt_callbacks: dict[str, FrozenModelCheckpoint] = {}
+
+    def _append_frozen_ckpt(metric_id: str, monitor: str, mode: str, tag: str, frozen: bool) -> None:
+        ckpt_cb = FrozenModelCheckpoint(
+            dirpath=str(ckpt_dir),
+            monitor=monitor,
+            filename=(
+                f"{model.encoder_arch}"
+                + f"_epoch({{epoch:02d}})_step({{step:04d}})_"
+                + f"{tag}[{{{monitor}:.4f}}]"
+            ),
+            auto_insert_metric_name=False,
+            save_weights_only=True,
+            save_top_k=1,
+            mode=mode,
+            metric_id=metric_id,
+        )
+        ckpt_cb.frozen = frozen
+        ece_ckpt_callbacks[metric_id] = ckpt_cb
+        callbacks.append(ckpt_cb)
+
+    if not cfg.get("no_checkpoint") and phased_early_stop:
+        recall_ckpt_spec = resolve_recall_early_stop_ckpt_spec(cfg)
+        run_log_dir = cfg.get("log_dir")
+        ckpt_dir = (
+            Path(run_log_dir) / "checkpoints"
+            if run_log_dir
+            else Path(cfg.get("logs_folder", "logs/MixVPR")) / "checkpoints"
+        )
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("Saving phased early-stop checkpoints under %s", ckpt_dir)
+        metric_id, monitor, mode, tag = recall_ckpt_spec
         logger.info(
-            "ModelCheckpoint monitor=%r mode=%s (from early_stop_metrics=%s)",
-            ckpt_monitor,
-            ckpt_mode,
-            cfg.get("early_stop_metrics"),
+            "ModelCheckpoint monitor=%r mode=%s metric_id=%s (Phase 1, save_top_k=1)",
+            monitor,
+            mode,
+            metric_id,
+        )
+        _append_frozen_ckpt(metric_id, monitor, mode, tag, frozen=False)
+        for metric_id, monitor, mode, tag in ece_ckpt_specs:
+            logger.info(
+                "ModelCheckpoint monitor=%r mode=%s metric_id=%s (Phase 2, save_top_k=1)",
+                monitor,
+                mode,
+                metric_id,
+            )
+            _append_frozen_ckpt(metric_id, monitor, mode, tag, frozen=True)
+
+    if not cfg.get("no_checkpoint") and multi_ece_early_stop and not phased_early_stop:
+        run_log_dir = cfg.get("log_dir")
+        ckpt_dir = (
+            Path(run_log_dir) / "checkpoints"
+            if run_log_dir
+            else Path(cfg.get("logs_folder", "logs/MixVPR")) / "checkpoints"
+        )
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("Saving checkpoints under %s", ckpt_dir)
+        for metric_id, monitor, mode, tag in ece_ckpt_specs:
+            logger.info(
+                "ModelCheckpoint monitor=%r mode=%s metric_id=%s (save_top_k=1)",
+                monitor,
+                mode,
+                metric_id,
+            )
+            ckpt_cb = FrozenModelCheckpoint(
+                dirpath=str(ckpt_dir),
+                monitor=monitor,
+                filename=(
+                    f"{model.encoder_arch}"
+                    + f"_epoch({{epoch:02d}})_step({{step:04d}})_"
+                    + f"{tag}[{{{monitor}:.4f}}]"
+                ),
+                auto_insert_metric_name=False,
+                save_weights_only=True,
+                save_top_k=1,
+                mode=mode,
+                metric_id=metric_id,
+            )
+            ece_ckpt_callbacks[metric_id] = ckpt_cb
+            callbacks.append(ckpt_cb)
+
+    if not cfg.get("disable_early_stop") and phased_early_stop:
+        recall_ckpt_spec = resolve_recall_early_stop_ckpt_spec(cfg)
+        logger.info(
+            "Phased early stop: Phase 1=recall, Phase 2=%s patience=%s",
+            [m[0] for m in ece_ckpt_specs],
+            patience,
         )
         callbacks.append(
+            PhasedMultiMetricEarlyStop(
+                recall_ckpt_spec, ece_ckpt_specs, patience, ece_ckpt_callbacks
+            )
+        )
+    elif not cfg.get("disable_early_stop") and multi_ece_early_stop:
+        logger.info(
+            "Multi-metric early stop: metrics=%s patience=%s (stop when all locked)",
+            [m[0] for m in ece_ckpt_specs],
+            patience,
+        )
+        callbacks.append(
+            MultiMetricEarlyStop(ece_ckpt_specs, patience, ece_ckpt_callbacks)
+        )
+    elif not cfg.get("disable_early_stop") and ckpt_monitor:
+        logger.info(
+            "EarlyStopping monitor=%r mode=%s patience=%s",
+            ckpt_monitor,
+            ckpt_mode,
+            patience,
+        )
+        callbacks.append(
+            EarlyStopping(
+                monitor=ckpt_monitor,
+                mode=ckpt_mode,
+                patience=patience,
+                verbose=True,
+            )
+        )
+
+    if not cfg.get("no_checkpoint") and ckpt_monitor:
+        run_log_dir = cfg.get("log_dir")
+        ckpt_dir = (
+            Path(run_log_dir) / "checkpoints"
+            if run_log_dir
+            else Path(cfg.get("logs_folder", "logs/MixVPR")) / "checkpoints"
+        )
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("Saving checkpoints under %s", ckpt_dir)
+        callbacks.append(
             ModelCheckpoint(
+                dirpath=str(ckpt_dir),
                 monitor=ckpt_monitor,
                 filename=(
                     f"{model.encoder_arch}"
@@ -365,7 +505,7 @@ if __name__ == "__main__":
         )
 
     use_gpu = cfg["device"] == "cuda"
-    default_root_dir = f"./LOGS/{model.encoder_arch}"
+    default_root_dir = str(Path(cfg.get("log_dir") or cfg.get("logs_folder", "logs/MixVPR")))
     trainer = pl.Trainer(
         accelerator="gpu" if use_gpu else "cpu",
         devices=1 if use_gpu else "auto",

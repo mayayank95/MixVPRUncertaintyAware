@@ -113,7 +113,7 @@ def parse_args() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
     p.add_argument("--disable_early_stop", action="store_true", help="Disable early stopping and always run all epochs")
     p.add_argument("--early_stop_metric", type=str, default="recall",
         help="Early-stop metrics separated by commas (,). Example: recall,ece_recall. "
-        "Tokens: recall; ece_recall (R@1 ECE); ece_recall_05; ece_recall_10. "
+        "Tokens: recall; ece_recall (R@1 ECE); ece_recall_05; ece_recall_10; ece_ap. "
         "Each metric has its own patience counter; each saves best_model_<metric>.pth (best_model.pth when only recall).")
     p.add_argument("--phased_early_stop", action="store_true",
         help="Two-phase early stopping: Phase 1 tracks recall only; when recall plateaus "
@@ -402,11 +402,16 @@ def normalize(merged: Dict[str, Any]) -> Dict[str, Any]:
     raw_es = out.get("early_stop_metric", "recall")
     out["early_stop_metrics"] = canonical_early_stop_metrics(raw_es)
     for m in out["early_stop_metrics"]:
-        if m.startswith("ece_recall_"):
+        if m.startswith("ece_recall_") or m == "ece_ap":
             if out.get("model_mode") != "uncertainty":
                 raise ValueError(f"early_stop_metric {m} requires model_mode=uncertainty.")
             if not out.get("use_labels"):
                 raise ValueError(f"early_stop_metric {m} requires use_labels.")
+
+    if "ece_ap" in out["early_stop_metrics"]:
+        ece_m = list(out.get("ece_metrics") or ["recall"])
+        if "ap" not in ece_m:
+            out["ece_metrics"] = ece_m + ["ap"]
 
     rv = list(out.get("recall_values") or [1, 5, 10, 20])
     need_k = recall_values_needed_for_metrics(out["early_stop_metrics"])
@@ -445,6 +450,8 @@ def _resolve_log_dir(logs_folder: Optional[str],
     """Determine where log files should go based on resume mode and script name."""
     if resume_checkpoint:
         resume_path = Path(resume_checkpoint)
+        if resume_path.is_dir():
+            return resume_path
         if resume_path.exists():
             timestamp = datetime.now().strftime("resume_train_%Y-%m-%d_%H-%M-%S")
             return resume_path.parent / timestamp

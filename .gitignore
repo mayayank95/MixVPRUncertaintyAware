@@ -8,6 +8,7 @@ __pycache__/
 LOGS/
 logs/
 cache/
+*.png
 *.ckpt
 *.pth
 .vscode/

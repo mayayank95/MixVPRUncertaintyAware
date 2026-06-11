@@ -12,6 +12,7 @@ VAL_SET_MAP: Dict[str, Tuple[str, str]] = {
     "pitts30k_val": ("pitts30k", "validation"),
     "pitts30k_test": ("pitts30k", "test"),
     "msls_val": ("msls-val", "validation"),
+    "sf_xl_val": ("sf_xl", "validation"),
 }
 
 

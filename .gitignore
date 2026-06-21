@@ -9,6 +9,7 @@ LOGS/
 logs/
 cache/
 *.png
+*.html
 *.ckpt
 *.pth
 .vscode/
@@ -16,3 +17,6 @@ cache/
 scripts/
 configs/datasets.json
 wandb/
+
+# Supervisor report (generated HTML, assets, sources, zip packages)
+reports/

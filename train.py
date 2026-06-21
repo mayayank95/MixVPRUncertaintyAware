@@ -13,6 +13,7 @@ import numpy as np
 from configs.parser import build_config
 from data.GSVCitiesDataloader import GSVCitiesDataModule, TRAIN_CITIES
 from losses.losses import get_loss, get_miner
+from data.place_weights import PlaceCentroidTable
 from losses.vmf_place_loss import place_centroid_targets
 from models.model_mode import _encode_inputs, build_model_mode
 from utils.runtime import init_model
@@ -22,6 +23,7 @@ from utils.mixvpr_eval import run_mixvpr_lightning_val_eval, run_mixvpr_validati
 from utils import wandb_utils
 from utils.early_stop_utils import (
     resolve_ece_early_stop_ckpt_specs,
+    resolve_ckpt_metric_specs,
     resolve_lightning_ckpt_monitor,
     resolve_recall_early_stop_ckpt_spec,
 )
@@ -79,10 +81,21 @@ class VPRModel(pl.LightningModule):
 
         for name, child in core.named_children():
             self.add_module(name, child)
-        self._var_from_feature_map = core._var_from_feature_map
+        self._var_from_feature_map = getattr(core, "_var_from_feature_map", False)
         self._uses_mixvpr = core._uses_mixvpr
         self._eval_cfg = cfg
         self._wandb_cb = None
+        self._flat_batches = bool(cfg.get("mixvpr_random_images"))
+        self._place_centroids = None
+        if cfg.get("use_pre_weights"):
+            weights_path = Path(cfg["pre_weights_path"])
+            self._place_centroids = PlaceCentroidTable.from_file(weights_path)
+            logger.info(
+                "Loaded pre_weights from %s (%d places, dim=%d)",
+                weights_path,
+                self._place_centroids.place_ids.numel(),
+                self._place_centroids.centroids.shape[1],
+            )
 
     def _set_train_mode(self) -> None:
         self.train()
@@ -102,31 +115,70 @@ class VPRModel(pl.LightningModule):
     def forward(self, x):
         feat, desc = _encode_inputs(self, x)
         mu = self.final_l2(desc)
+        if not hasattr(self, "var_head"):
+            return mu, torch.zeros_like(mu)
         if self._var_from_feature_map:
             variance = self.var_head(feat)
         else:
             variance = self.var_head(desc)
         return mu, variance + 1e-6
 
-    def configure_optimizers(self):
-        trainable = [p for p in self.parameters() if p.requires_grad]
+    def _uses_split_head_lr(self) -> bool:
+        return (
+            not self.freeze_base
+            and hasattr(self, "var_head")
+            and "uncertainty" in self._eval_cfg.get("losses", [])
+        )
+
+    def _build_optimizer_param_groups(self):
+        if self.freeze_base:
+            trainable = [p for p in self.parameters() if p.requires_grad]
+            if not trainable:
+                raise ValueError(
+                    "No trainable parameters. With --freeze_model, use model_mode=uncertainty "
+                    "so var_head (and final_l2) remain trainable."
+                )
+            return [{"params": trainable, "lr": self.head_lr, "initial_lr": self.head_lr}]
+
+        base_params = []
+        head_params = []
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            if self._uses_split_head_lr() and name.startswith("var_head."):
+                head_params.append(param)
+            else:
+                base_params.append(param)
+
+        if head_params:
+            logger.info(
+                "Joint training: backbone/aggregator lr=%s, var_head lr=%s",
+                self.lr,
+                self.head_lr,
+            )
+            return [
+                {"params": base_params, "lr": self.lr, "initial_lr": self.lr},
+                {"params": head_params, "lr": self.head_lr, "initial_lr": self.head_lr},
+            ]
+
+        trainable = base_params + head_params
         if not trainable:
             raise ValueError(
                 "No trainable parameters. With --freeze_model, use model_mode=uncertainty "
                 "so var_head (and final_l2) remain trainable."
             )
-        opt_lr = self.head_lr if self.freeze_base else self.lr
+        return [{"params": trainable, "lr": self.lr, "initial_lr": self.lr}]
+
+    def configure_optimizers(self):
+        param_groups = self._build_optimizer_param_groups()
         if self.optimizer.lower() == "sgd":
             optim = torch.optim.SGD(
-                trainable,
-                lr=opt_lr,
+                param_groups,
                 weight_decay=self.weight_decay,
                 momentum=self.momentum,
             )
         elif self.optimizer.lower() in ("adamw", "adam"):
-            optim = torch.optim.AdamW(
-                trainable, lr=opt_lr, weight_decay=self.weight_decay
-            )
+            optim = torch.optim.AdamW(param_groups, weight_decay=self.weight_decay)
         else:
             raise ValueError(
                 f'Optimizer {self.optimizer} has not been added to "configure_optimizers()"'
@@ -138,15 +190,18 @@ class VPRModel(pl.LightningModule):
 
     def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure=None):
         del epoch, batch_idx
-        base_lr = self.head_lr if self.freeze_base else self.lr
         if self.trainer.global_step < self.warmpup_steps:
             lr_scale = min(1.0, float(self.trainer.global_step + 1) / self.warmpup_steps)
             for pg in optimizer.param_groups:
-                pg["lr"] = lr_scale * base_lr
+                pg["lr"] = lr_scale * pg["initial_lr"]
         optimizer.step(closure=optimizer_closure)
 
     def _uncertainty_loss(self, descriptors, labels, variances):
-        targets = place_centroid_targets(descriptors, labels)
+        if self._place_centroids is not None:
+            # Offline: full-place aggregate (all images). Train: exclude this query.
+            targets = self._place_centroids.targets_excluding_query(descriptors, labels)
+        else:
+            targets = place_centroid_targets(descriptors, labels)
         kappa = variances.mean(dim=-1, keepdim=True)
         return self.uncertainty_lambda * self.loss_uncertainty(descriptors, kappa, targets)
 
@@ -178,10 +233,13 @@ class VPRModel(pl.LightningModule):
         return loss
 
     def training_step(self, batch, batch_idx):
-        places, labels = batch
-        bs, n, ch, h, w = places.shape
-        images = places.view(bs * n, ch, h, w)
-        labels = labels.view(-1)
+        if self._flat_batches:
+            images, labels = batch
+        else:
+            places, labels = batch
+            bs, n, ch, h, w = places.shape
+            images = places.view(bs * n, ch, h, w)
+            labels = labels.view(-1)
 
         descriptors, variances = self(images)
         loss = self.loss_function(descriptors, labels, variances)
@@ -339,6 +397,9 @@ if __name__ == "__main__":
         positive_dist_threshold=cfg["positive_dist_threshold"],
         base_path=cfg.get("gsv_base_path"),
         sfxl_train_root=cfg.get("sfxl_train_root"),
+        random_images=bool(cfg.get("mixvpr_random_images")),
+        places_csv_path=cfg.get("places_csv_path"),
+        pre_weights_path=cfg.get("pre_weights_path"),
     )
 
     callbacks = [
@@ -352,10 +413,17 @@ if __name__ == "__main__":
     # attach_val_ece_callback(cfg, callbacks)  # old: duplicate FAISS for ECE only
 
     ece_ckpt_specs = resolve_ece_early_stop_ckpt_specs(cfg)
+    ckpt_metric_specs = resolve_ckpt_metric_specs(cfg)
     phased_early_stop = bool(cfg.get("phased_early_stop")) and bool(ece_ckpt_specs)
     multi_ece_early_stop = len(ece_ckpt_specs) >= 2
+    multi_ckpt_metrics = bool(ckpt_metric_specs)
     need_ckpt_monitor = not cfg.get("no_checkpoint") or not cfg.get("disable_early_stop")
-    if need_ckpt_monitor and not multi_ece_early_stop and not phased_early_stop:
+    if (
+        need_ckpt_monitor
+        and not multi_ece_early_stop
+        and not phased_early_stop
+        and not multi_ckpt_metrics
+    ):
         ckpt_monitor, ckpt_mode, ckpt_tag = resolve_lightning_ckpt_monitor(cfg)
     else:
         ckpt_monitor = ckpt_mode = ckpt_tag = None
@@ -441,6 +509,38 @@ if __name__ == "__main__":
             )
             ece_ckpt_callbacks[metric_id] = ckpt_cb
             callbacks.append(ckpt_cb)
+
+    if not cfg.get("no_checkpoint") and multi_ckpt_metrics and not phased_early_stop:
+        run_log_dir = cfg.get("log_dir")
+        ckpt_dir = (
+            Path(run_log_dir) / "checkpoints"
+            if run_log_dir
+            else Path(cfg.get("logs_folder", "logs/MixVPR")) / "checkpoints"
+        )
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("Saving multi-metric checkpoints under %s", ckpt_dir)
+        for metric_id, monitor, mode, tag in ckpt_metric_specs:
+            logger.info(
+                "ModelCheckpoint monitor=%r mode=%s metric_id=%s (save_top_k=1)",
+                monitor,
+                mode,
+                metric_id,
+            )
+            callbacks.append(
+                ModelCheckpoint(
+                    dirpath=str(ckpt_dir),
+                    monitor=monitor,
+                    filename=(
+                        f"{model.encoder_arch}"
+                        + f"_epoch({{epoch:02d}})_step({{step:04d}})_"
+                        + f"{tag}[{{{monitor}:.4f}}]"
+                    ),
+                    auto_insert_metric_name=False,
+                    save_weights_only=True,
+                    save_top_k=1,
+                    mode=mode,
+                )
+            )
 
     if not cfg.get("disable_early_stop") and phased_early_stop:
         recall_ckpt_spec = resolve_recall_early_stop_ckpt_spec(cfg)

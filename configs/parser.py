@@ -175,6 +175,28 @@ def parse_args() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
         help='Comma-separated city CSV names (e.g. "SF3770,SF3771" or "London,Boston"). '
         "Default: 23 GSV TRAIN_CITIES.",
     )
+    p.add_argument(
+        "--use_pre_weights",
+        action="store_true",
+        help="Load full-place offline weights (all images/place); LOO target built at train time.",
+    )
+    p.add_argument(
+        "--pre_weights_path",
+        type=str,
+        default=None,
+        help="Path to place-centroid .pt produced by pre_weights.py (required with --use_pre_weights).",
+    )
+    p.add_argument(
+        "--places_csv_path",
+        type=str,
+        default=None,
+        help="Places image index CSV from pre_weights.py (required with --mixvpr_random_images).",
+    )
+    p.add_argument(
+        "--mixvpr_random_images",
+        action="store_true",
+        help="Train on random single images (batch_size = #images). Decouples batch from img_per_place.",
+    )
 
     # MixVPR (train.py) — hyperparameters
     p.add_argument("--mixvpr_optimizer", type=str, default="sgd", choices=["sgd", "adamw", "adam"],
@@ -226,6 +248,13 @@ def parse_args() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
         "from --early_stop_metric instead.",
     )
     p.add_argument("--mixvpr_ckpt_save_top_k", type=int, default=3, help="ModelCheckpoint save_top_k")
+    p.add_argument(
+        "--ckpt_metrics",
+        type=str,
+        default=None,
+        help="Save one best checkpoint per metric (comma-separated), independent of early stopping. "
+        "Example: recall,ece_recall saves best R@1 and best ECE@R1 on the first val set.",
+    )
 
 
     # Data augmentation
@@ -401,12 +430,31 @@ def normalize(merged: Dict[str, Any]) -> Dict[str, Any]:
 
     raw_es = out.get("early_stop_metric", "recall")
     out["early_stop_metrics"] = canonical_early_stop_metrics(raw_es)
-    for m in out["early_stop_metrics"]:
-        if m.startswith("ece_recall_") or m == "ece_ap":
-            if out.get("model_mode") != "uncertainty":
-                raise ValueError(f"early_stop_metric {m} requires model_mode=uncertainty.")
-            if not out.get("use_labels"):
-                raise ValueError(f"early_stop_metric {m} requires use_labels.")
+    if out.get("disable_early_stop") and not out.get("ckpt_metrics"):
+        # Config file defaults (e.g. datasets.json ece_recall) must not block runs that
+        # disable early stopping and use a separate checkpoint monitor (pitts30k_val/R1).
+        out["early_stop_metrics"] = ["recall"]
+    else:
+        for m in out["early_stop_metrics"]:
+            if m.startswith("ece_recall_") or m == "ece_ap":
+                if out.get("model_mode") != "uncertainty":
+                    raise ValueError(f"early_stop_metric {m} requires model_mode=uncertainty.")
+                if not out.get("use_labels"):
+                    raise ValueError(f"early_stop_metric {m} requires use_labels.")
+
+    if out.get("ckpt_metrics"):
+        ckpt_metrics = canonical_early_stop_metrics(out["ckpt_metrics"])
+        for m in ckpt_metrics:
+            if m.startswith("ece_recall_") or m == "ece_ap":
+                if out.get("model_mode") != "uncertainty":
+                    raise ValueError(f"ckpt_metrics {m} requires model_mode=uncertainty.")
+                if not out.get("use_labels"):
+                    raise ValueError(f"ckpt_metrics {m} requires use_labels.")
+        need_k = recall_values_needed_for_metrics(ckpt_metrics)
+        rv = list(out.get("recall_values") or [1, 5, 10, 20])
+        merged_rv = sorted(set(rv) | set(need_k))
+        if merged_rv != rv:
+            out["recall_values"] = merged_rv
 
     if "ece_ap" in out["early_stop_metrics"]:
         ece_m = list(out.get("ece_metrics") or ["recall"])
@@ -432,6 +480,11 @@ def normalize(merged: Dict[str, Any]) -> Dict[str, Any]:
         if "recall" not in es:
             out["early_stop_metrics"] = ["recall"] + es
             logger.info("phased_early_stop: auto-added 'recall' to early_stop_metrics for Phase 1.")
+
+    if out.get("use_pre_weights") and not out.get("pre_weights_path"):
+        raise ValueError("use_pre_weights requires --pre_weights_path")
+    if out.get("mixvpr_random_images") and not out.get("places_csv_path"):
+        raise ValueError("mixvpr_random_images requires --places_csv_path")
 
     out["var_head_agg"] = bool(out.get("var_head_agg", False))
     out["var_head_linear"] = str(out.get("var_head_linear", "d")).lower()

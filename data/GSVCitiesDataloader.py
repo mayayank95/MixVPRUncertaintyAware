@@ -1,4 +1,5 @@
 import multiprocessing as mp
+from pathlib import Path
 from typing import Any, Dict
 
 import pytorch_lightning as pl
@@ -6,6 +7,8 @@ from torch.utils.data.dataloader import DataLoader
 from torchvision import transforms as T
 
 from data.GSVCitiesDataset import GSVCitiesDataset
+from data.place_weights import GSVCitiesRandomImageDataset, load_places_csv
+from data.place_weights import PlaceCentroidTable
 from data.mixvpr_val_dataset import build_val_dataset, load_val_dataset_paths
 from prettytable import PrettyTable
 
@@ -65,6 +68,9 @@ class GSVCitiesDataModule(pl.LightningDataModule):
         positive_dist_threshold=25,
         base_path=None,
         sfxl_train_root=None,
+        random_images=False,
+        places_csv_path=None,
+        pre_weights_path=None,
     ):
         super().__init__()
         self.batch_size = batch_size
@@ -84,6 +90,9 @@ class GSVCitiesDataModule(pl.LightningDataModule):
         self.positive_dist_threshold = positive_dist_threshold
         self.base_path = base_path
         self.sfxl_train_root = sfxl_train_root
+        self.random_images = bool(random_images)
+        self.places_csv_path = places_csv_path
+        self.pre_weights_path = pre_weights_path
         self.save_hyperparameters()
 
         self.train_transform = T.Compose([
@@ -138,6 +147,25 @@ class GSVCitiesDataModule(pl.LightningDataModule):
                 self.print_stats()
 
     def reload(self):
+        if self.random_images:
+            if not self.places_csv_path:
+                raise ValueError("random_images training requires places_csv_path")
+            places_df = load_places_csv(
+                self.places_csv_path,
+                min_img_per_place=self.min_img_per_place,
+            )
+            place_ids = None
+            if self.pre_weights_path:
+                place_ids = PlaceCentroidTable.from_file(
+                    Path(self.pre_weights_path)
+                ).place_ids.tolist()
+            self.train_dataset = GSVCitiesRandomImageDataset(
+                places_df,
+                transform=self.train_transform,
+                place_ids=place_ids,
+            )
+            return
+
         kwargs = {}
         if self.base_path is not None:
             kwargs["base_path"] = self.base_path
@@ -154,7 +182,10 @@ class GSVCitiesDataModule(pl.LightningDataModule):
 
     def train_dataloader(self):
         self.reload()
-        return DataLoader(dataset=self.train_dataset, **self.train_loader_config)
+        loader_cfg = dict(self.train_loader_config)
+        if self.random_images:
+            loader_cfg["shuffle"] = True
+        return DataLoader(dataset=self.train_dataset, **loader_cfg)
 
     def val_dataloader(self):
         return [
@@ -169,8 +200,13 @@ class GSVCitiesDataModule(pl.LightningDataModule):
         table.align["Value"] = "l"
         table.header = False
         table.add_row(["# of cities", f"{len(self.cities)}"])
-        table.add_row(["# of places", f"{self.train_dataset.__len__()}"])
-        table.add_row(["# of images", f"{self.train_dataset.total_nb_images}"])
+        if self.random_images:
+            table.add_row(["# of places", f"{self.train_dataset.df['place_id'].nunique()}"])
+            table.add_row(["# of images", f"{len(self.train_dataset)}"])
+            table.add_row(["sampling", "random images (flat batch)"])
+        else:
+            table.add_row(["# of places", f"{self.train_dataset.__len__()}"])
+            table.add_row(["# of images", f"{self.train_dataset.total_nb_images}"])
         print(table.get_string(title="Training Dataset"))
 
         table = PrettyTable()

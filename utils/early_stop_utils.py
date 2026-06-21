@@ -187,3 +187,22 @@ def resolve_ece_early_stop_ckpt_specs(cfg: dict) -> List[tuple[str, str, str, st
                 lightning_ckpt_filename_tag(metric),
             ))
     return specs
+
+
+def resolve_ckpt_metric_specs(cfg: dict) -> List[tuple[str, str, str, str]]:
+    """``(canonical_id, monitor, mode, filename_tag)`` for each ``--ckpt_metrics`` entry."""
+    raw = cfg.get("ckpt_metrics")
+    if not raw:
+        return []
+    val_set = _first_val_set_name(cfg)
+    metrics = canonical_early_stop_metrics(raw)
+    specs: List[tuple[str, str, str, str]] = []
+    for metric in metrics:
+        mode = "max" if metric == "recall" else "min"
+        specs.append((
+            metric,
+            lightning_ckpt_metric_name(metric, val_set),
+            mode,
+            lightning_ckpt_filename_tag(metric),
+        ))
+    return specs

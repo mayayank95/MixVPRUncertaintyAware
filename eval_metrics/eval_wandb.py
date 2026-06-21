@@ -573,11 +573,114 @@ def _render_image_tile(
     return output_path.resolve()
 
 
+def _is_numeric_cell(cell: Any) -> bool:
+    if cell is None:
+        return False
+    if isinstance(cell, (int, float, np.floating)):
+        return not (isinstance(cell, float) and math.isnan(cell))
+    return False
+
+
+def _best_positions(
+    indexed_values: List[Tuple[int, float]],
+    *,
+    higher_better: bool,
+) -> List[int]:
+    """Return indices tied for the best value in ``indexed_values``."""
+    if not indexed_values:
+        return []
+    if higher_better:
+        best = max(v for _, v in indexed_values)
+        return [i for i, v in indexed_values if v == best]
+    best = min(v for _, v in indexed_values)
+    return [i for i, v in indexed_values if v == best]
+
+
+def _bold_mask_variant_rows(
+    rows: List[List[Any]],
+    *,
+    variant_col: int,
+    numeric_start: int,
+    main_labels: frozenset,
+    pairwise_labels: frozenset,
+    higher_better: bool,
+) -> set:
+    """Per dataset row-group: bold best numeric cell in each comparison group."""
+    bold: set = set()
+    by_dataset: Dict[Any, List[Tuple[int, List[Any]]]] = {}
+    for row_idx, row in enumerate(rows):
+        by_dataset.setdefault(row[0], []).append((row_idx, row))
+
+    for entries in by_dataset.values():
+        for col_idx in range(numeric_start, len(entries[0][1])):
+            main_vals = [
+                (row_idx, float(row[col_idx]))
+                for row_idx, row in entries
+                if row[variant_col] in main_labels and _is_numeric_cell(row[col_idx])
+            ]
+            pair_vals = [
+                (row_idx, float(row[col_idx]))
+                for row_idx, row in entries
+                if row[variant_col] in pairwise_labels and _is_numeric_cell(row[col_idx])
+            ]
+            for row_idx in _best_positions(main_vals, higher_better=higher_better):
+                bold.add((row_idx, col_idx))
+            for row_idx in _best_positions(pair_vals, higher_better=higher_better):
+                bold.add((row_idx, col_idx))
+    return bold
+
+
+def _bold_mask_auc_pr_columns(cols: List[str], rows: List[List[Any]]) -> set:
+    """Per dataset row: bold best column within each method group."""
+    bold: set = set()
+    col_idx = {name: i for i, name in enumerate(cols)}
+    main_cols = [col_idx[c] for c in _AUC_PR_MAIN_COLUMNS if c in col_idx]
+    pair_cols = [col_idx[c] for c in _AUC_PR_PAIRWISE_COLUMNS if c in col_idx]
+
+    for row_idx, row in enumerate(rows):
+        main_vals = [
+            (col_idx, float(row[col_idx]))
+            for col_idx in main_cols
+            if col_idx < len(row) and _is_numeric_cell(row[col_idx])
+        ]
+        pair_vals = [
+            (col_idx, float(row[col_idx]))
+            for col_idx in pair_cols
+            if col_idx < len(row) and _is_numeric_cell(row[col_idx])
+        ]
+        for col_idx in _best_positions(main_vals, higher_better=True):
+            bold.add((row_idx, col_idx))
+        for col_idx in _best_positions(pair_vals, higher_better=True):
+            bold.add((row_idx, col_idx))
+    return bold
+
+
+def _summary_table_bold_cells(
+    table_key: str,
+    cols: List[str],
+    rows: List[List[Any]],
+) -> set:
+    if table_key not in _CALIBRATION_COMPARISON_TABLE_KEYS:
+        return set()
+    if table_key == AUC_PR_PANEL_KEY:
+        return _bold_mask_auc_pr_columns(cols, rows)
+    # calibration_ece + uncertainty_stats: lower is better (ECE / score magnitude).
+    return _bold_mask_variant_rows(
+        rows,
+        variant_col=1,
+        numeric_start=2,
+        main_labels=_CALIBRATION_MAIN_VARIANT_LABELS,
+        pairwise_labels=_CALIBRATION_PAIRWISE_VARIANT_LABELS,
+        higher_better=False,
+    )
+
+
 def _html_table(
     headers: List[str],
     rows: List[List[Any]],
     *,
     label_columns: int = 1,
+    bold_cells: Optional[set] = None,
 ) -> Any:
     """Compact HTML table (all rows visible; avoids W&B Table row pagination)."""
     import wandb as _wandb
@@ -593,19 +696,40 @@ def _html_table(
     th_style = "style='border:1px solid #555;padding:6px;background:#2a2a2a;color:#eee;'"
     td_style = "style='border:1px solid #555;padding:6px;text-align:center;'"
     td_label = "style='border:1px solid #555;padding:6px;text-align:left;font-weight:bold;'"
+    td_bold = "style='border:1px solid #555;padding:6px;text-align:center;font-weight:bold;'"
     html = [f"<table {style}><tr>"]
     for h in headers:
         html.append(f"<th {th_style}>{h}</th>")
     html.append("</tr>")
-    for row in rows:
+    for row_idx, row in enumerate(rows):
         html.append("<tr>")
-        for i, cell in enumerate(row):
-            s = td_label if i < label_columns else td_style
+        for col_idx, cell in enumerate(row):
+            if col_idx < label_columns:
+                s = td_label
+            elif bold_cells and (row_idx, col_idx) in bold_cells:
+                s = td_bold
+            else:
+                s = td_style
             html.append(f"<td {s}>{_cell_text(cell)}</td>")
         html.append("</tr>")
     html.append("</table>")
     return _wandb.Html("".join(html))
 
+
+# Variant labels in ``calibration_ece`` / ``uncertainty_stats`` rows (column 1).
+_CALIBRATION_MAIN_VARIANT_LABELS = frozenset(
+    {"kappa", "joint_kappa", "l2", "pa", "sue_log"}
+)
+_CALIBRATION_PAIRWISE_VARIANT_LABELS = frozenset({"pairwise_l2", "pairwise"})
+
+# ``AUC-PR`` table column headers (one row per dataset).
+_AUC_PR_MAIN_COLUMNS = frozenset({"kappa", "joint_kappa", "l2", "pa", "sue_log"})
+_AUC_PR_PAIRWISE_COLUMNS = frozenset({"pairwise_l2", "pairwise_kappa"})
+
+# Tables that compare calibration methods (bold best per group in summary HTML).
+_CALIBRATION_COMPARISON_TABLE_KEYS = frozenset(
+    {"calibration_ece", AUC_PR_PANEL_KEY, "uncertainty_stats"}
+)
 
 # label_columns: leading columns rendered left-aligned (dataset / variant names).
 _SUMMARY_TABLE_LABEL_COLS = {
@@ -766,10 +890,12 @@ def build_eval_summary_html_panels(
     for key, (cols, rows) in _build_eval_summary_tables(
         cfg, all_panel_data, combined_outputs
     ).items():
+        bold_cells = _summary_table_bold_cells(key, cols, rows)
         panels[f"{key}/summary_html"] = _html_table(
             cols,
             rows,
             label_columns=_SUMMARY_TABLE_LABEL_COLS.get(key, 1),
+            bold_cells=bold_cells,
         )
     return panels
 

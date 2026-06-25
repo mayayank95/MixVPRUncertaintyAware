@@ -1,0 +1,34 @@
+{
+  "tag": "dim512_min4",
+  "models": [
+    {
+      "slug": "mixvpr_official",
+      "label": "MixVPR official (ResNet50, 512-d)",
+      "loader": "mixvpr",
+      "backbone": "ResNet50",
+      "dim": 512,
+      "image_size": 320,
+      "ckpt": "logs/MixVPR/resnet50_MixVPR_512_channels(256)_rows(2).ckpt",
+      "ckpt_state_dict_key": "state_dict",
+      "legacy_cache": "analysis/place_latent_space/outputs/gsv/cache/mixvpr512_mixvpr512_cos512_min4_encodings.pt"
+    },
+    {
+      "slug": "cosplace_hub",
+      "label": "CosPlace official (ResNet50, 512-d, torch.hub)",
+      "loader": "cosplace_hub",
+      "backbone": "ResNet50",
+      "dim": 512,
+      "image_size": 512,
+      "legacy_cache": "analysis/place_latent_space/outputs/gsv/cache/cosplace512_mixvpr512_cos512_min4_encodings.pt"
+    },
+    {
+      "slug": "cosplace_local_sfxl",
+      "label": "CosPlace basic SF-XL trained (2026-04-09_09-51-14, ResNet50, 512-d)",
+      "loader": "cosplace_local",
+      "backbone": "ResNet50",
+      "dim": 512,
+      "image_size": 512,
+      "ckpt": "/home/dsi/mayayan/projects/UncertaintyAwareVPR/logs/CosPlace/2026-04-09_09-51-14/best_model.pth"
+    }
+  ]
+}

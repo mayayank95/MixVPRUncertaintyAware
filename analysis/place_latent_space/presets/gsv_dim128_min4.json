@@ -1,0 +1,23 @@
+{
+  "tag": "dim128_min4",
+  "models": [
+    {
+      "slug": "mixvpr_official",
+      "label": "MixVPR official (ResNet50, 128-d)",
+      "loader": "mixvpr",
+      "backbone": "ResNet50",
+      "dim": 128,
+      "image_size": 320,
+      "ckpt": "logs/MixVPR/resnet50_MixVPR_128_channels(64)_rows(2).ckpt",
+      "ckpt_state_dict_key": "state_dict"
+    },
+    {
+      "slug": "cosplace_hub",
+      "label": "CosPlace official (ResNet50, 128-d, torch.hub)",
+      "loader": "cosplace_hub",
+      "backbone": "ResNet50",
+      "dim": 128,
+      "image_size": 512
+    }
+  ]
+}

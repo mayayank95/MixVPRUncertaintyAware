@@ -10,13 +10,18 @@ logs/
 cache/
 *.png
 *.html
+*.json
+!analysis/place_latent_space/presets/**/*.json
 *.ckpt
 *.pth
 .vscode/
 .idea/
 scripts/
-configs/datasets.json
 wandb/
 
 # Supervisor report (generated HTML, assets, sources, zip packages)
 reports/
+
+# GSV place latent-space generated outputs
+analysis/place_latent_space/outputs/**/*.md
+analysis/place_latent_space/outputs/**/cache/

@@ -181,6 +181,12 @@ def parse_args() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
         help="Load full-place offline weights (all images/place); LOO target built at train time.",
     )
     p.add_argument(
+        "--use_medoid_targets",
+        action="store_true",
+        help="With --use_pre_weights: use precomputed place medoid "
+        "(argmax_j sum_k z_j^T z_k) as vMF target and exclude medoid images from training.",
+    )
+    p.add_argument(
         "--pre_weights_path",
         type=str,
         default=None,
@@ -480,6 +486,9 @@ def normalize(merged: Dict[str, Any]) -> Dict[str, Any]:
         if "recall" not in es:
             out["early_stop_metrics"] = ["recall"] + es
             logger.info("phased_early_stop: auto-added 'recall' to early_stop_metrics for Phase 1.")
+
+    if out.get("use_medoid_targets") and not out.get("use_pre_weights"):
+        raise ValueError("use_medoid_targets requires --use_pre_weights")
 
     if out.get("use_pre_weights") and not out.get("pre_weights_path"):
         raise ValueError("use_pre_weights requires --pre_weights_path")

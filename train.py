@@ -87,15 +87,27 @@ class VPRModel(pl.LightningModule):
         self._wandb_cb = None
         self._flat_batches = bool(cfg.get("mixvpr_random_images"))
         self._place_centroids = None
+        self._use_medoid_targets = bool(cfg.get("use_medoid_targets"))
         if cfg.get("use_pre_weights"):
             weights_path = Path(cfg["pre_weights_path"])
             self._place_centroids = PlaceCentroidTable.from_file(weights_path)
+            target_kind = "medoid" if self._use_medoid_targets else "centroid"
             logger.info(
-                "Loaded pre_weights from %s (%d places, dim=%d)",
+                "Loaded pre_weights from %s (%d places, dim=%d, target=%s)",
                 weights_path,
                 self._place_centroids.place_ids.numel(),
                 self._place_centroids.centroids.shape[1],
+                target_kind,
             )
+            if self._use_medoid_targets and self._place_centroids.medoids is None:
+                raise ValueError(
+                    f"{weights_path} has no medoids; re-run pre_weights.py to rebuild weights."
+                )
+            if self._use_medoid_targets and self._place_centroids.medoid_image_paths is None:
+                raise ValueError(
+                    f"{weights_path} has no medoid_image_paths; "
+                    "re-run pre_weights.py to rebuild weights."
+                )
 
     def _set_train_mode(self) -> None:
         self.train()
@@ -198,8 +210,11 @@ class VPRModel(pl.LightningModule):
 
     def _uncertainty_loss(self, descriptors, labels, variances):
         if self._place_centroids is not None:
-            # Offline: full-place aggregate (all images). Train: exclude this query.
-            targets = self._place_centroids.targets_excluding_query(descriptors, labels)
+            if self._use_medoid_targets:
+                targets = self._place_centroids.medoid_targets(descriptors, labels)
+            else:
+                # Offline: full-place aggregate (all images). Train: exclude this query.
+                targets = self._place_centroids.targets_excluding_query(descriptors, labels)
         else:
             targets = place_centroid_targets(descriptors, labels)
         kappa = variances.mean(dim=-1, keepdim=True)
@@ -400,6 +415,7 @@ if __name__ == "__main__":
         random_images=bool(cfg.get("mixvpr_random_images")),
         places_csv_path=cfg.get("places_csv_path"),
         pre_weights_path=cfg.get("pre_weights_path"),
+        use_medoid_targets=bool(cfg.get("use_medoid_targets")),
     )
 
     callbacks = [

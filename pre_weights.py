@@ -16,6 +16,7 @@ from data.place_weights import (
     load_places_csv,
     save_place_weights,
     write_places_csv,
+    _subset_places_df,
 )
 from models.model_mode import build_model_mode
 from utils.runtime import init_model
@@ -60,6 +61,7 @@ def main() -> None:
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--csv_in", type=str, default=None, help="Reuse existing places CSV instead of rebuilding.")
+    parser.add_argument("--max_places", type=int, default=0, help="Debug: keep only the first N places.")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -105,6 +107,15 @@ def main() -> None:
         )
         write_places_csv(places_df, csv_out)
 
+    if args.max_places > 0:
+        places_df = _subset_places_df(places_df, args.max_places)
+        logger.info(
+            "Debug subset: %d images, %d places (max_places=%d)",
+            len(places_df),
+            places_df["place_id"].nunique(),
+            args.max_places,
+        )
+
     if not args.weights_out:
         return
 
@@ -113,7 +124,7 @@ def main() -> None:
 
     device = torch.device("cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu")
     model = _load_encoder(cfg, device)
-    place_ids, centroids, place_sums, counts = compute_place_centroids(
+    place_ids, centroids, place_sums, counts, medoids, medoid_image_paths = compute_place_centroids(
         model,
         device,
         places_df,
@@ -127,6 +138,8 @@ def main() -> None:
         centroids,
         place_sums,
         counts,
+        medoids=medoids,
+        medoid_image_paths=medoid_image_paths,
         metadata={
             "csv_out": str(csv_out),
             "min_img_per_place": args.min_img_per_place,

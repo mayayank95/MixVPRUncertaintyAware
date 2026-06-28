@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import DefaultDict, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 import torch
@@ -133,6 +134,15 @@ class GSVCitiesRandomImageDataset(Dataset):
         return img, int(row["place_id"])
 
 
+def exclude_medoid_training_images(
+    places_df: pd.DataFrame,
+    medoid_image_paths: Sequence[str],
+) -> pd.DataFrame:
+    """Drop medoid rows from the training index."""
+    exclude = set(medoid_image_paths)
+    return places_df[~places_df["image_path"].isin(exclude)].copy().reset_index(drop=True)
+
+
 class _PlaceImageDataset(Dataset):
     def __init__(self, df: pd.DataFrame, transform: T.Compose):
         self.df = df.reset_index(drop=True)
@@ -146,7 +156,19 @@ class _PlaceImageDataset(Dataset):
         img = Image.open(row["image_path"]).convert("RGB")
         if self.transform is not None:
             img = self.transform(img)
-        return img, int(row["place_id"])
+        return img, int(row["place_id"]), str(row["image_path"])
+
+
+@torch.no_grad()
+def _medoid_from_place_descriptors(
+    descriptors: torch.Tensor,
+    image_paths: List[str],
+) -> Tuple[torch.Tensor, str]:
+    """Medoid = argmax_j sum_k z_j^T z_k over L2-normalized place descriptors."""
+    z = F.normalize(descriptors, dim=-1)
+    scores = z @ z.sum(dim=0)
+    best = int(scores.argmax().item())
+    return z[best], image_paths[best]
 
 
 @torch.no_grad()
@@ -157,13 +179,24 @@ def compute_place_centroids(
     image_size: int = 320,
     batch_size: int = 64,
     num_workers: int = 4,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    *,
+    compute_medoids: bool = True,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[List[str]],
+]:
     """Encode all place images.
 
-    Returns ``(place_ids, centroids, place_sums, counts)``.
+    Returns ``(place_ids, centroids, place_sums, counts[, medoids[, medoid_image_paths]])``.
 
     Offline: one aggregate per place over **all** its images (no per-query LOO).
     ``centroids`` = L2-normalized mean; ``place_sums`` = unnormalized descriptor sum.
+    ``medoids`` = L2-normalized descriptor of the place medoid
+    (argmax_j sum_k z_j^T z_k); ``medoid_image_paths`` = that image's path.
     """
     model.eval()
     transform = T.Compose([
@@ -185,8 +218,10 @@ def compute_place_centroids(
     dim: Optional[int] = None
     sums: Optional[torch.Tensor] = None
     counts = torch.zeros(len(unique_place_ids), dtype=torch.long)
+    place_descs: DefaultDict[int, List[torch.Tensor]] = defaultdict(list)
+    place_paths: DefaultDict[int, List[str]] = defaultdict(list)
 
-    for images, place_ids in loader:
+    for images, place_ids, image_paths in loader:
         images = images.to(device, non_blocking=True)
         out = model(images)
         descriptors = out[0] if isinstance(out, tuple) else out
@@ -195,16 +230,35 @@ def compute_place_centroids(
             dim = int(descriptors.shape[1])
             sums = torch.zeros(len(unique_place_ids), dim, dtype=torch.float32)
 
-        for desc, place_id in zip(descriptors, place_ids.tolist()):
-            idx = id_to_idx[int(place_id)]
+        for desc, place_id, image_path in zip(
+            descriptors, place_ids.tolist(), image_paths
+        ):
+            pid = int(place_id)
+            idx = id_to_idx[pid]
             sums[idx] += desc
             counts[idx] += 1
+            if compute_medoids:
+                place_descs[pid].append(desc)
+                place_paths[pid].append(image_path)
 
     assert sums is not None and dim is not None
     counts_f = counts.clamp_min(1).unsqueeze(1).to(sums.dtype)
     centroids = F.normalize(sums / counts_f, dim=-1)
     place_ids_t = torch.tensor(unique_place_ids, dtype=torch.long)
-    return place_ids_t, centroids, sums, counts
+    medoids = None
+    medoid_image_paths = None
+    if compute_medoids:
+        medoids = torch.zeros(len(unique_place_ids), dim, dtype=torch.float32)
+        medoid_image_paths = []
+        for pid in unique_place_ids:
+            idx = id_to_idx[pid]
+            medoid, path = _medoid_from_place_descriptors(
+                torch.stack(place_descs[pid]),
+                place_paths[pid],
+            )
+            medoids[idx] = medoid
+            medoid_image_paths.append(path)
+    return place_ids_t, centroids, sums, counts, medoids, medoid_image_paths
 
 
 def save_place_weights(
@@ -214,6 +268,8 @@ def save_place_weights(
     place_sums: torch.Tensor,
     counts: torch.Tensor,
     metadata: Optional[dict] = None,
+    medoids: Optional[torch.Tensor] = None,
+    medoid_image_paths: Optional[List[str]] = None,
 ) -> None:
     """Save one full-place weight per ``place_id`` (all images; LOO is applied at train time)."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -224,18 +280,31 @@ def save_place_weights(
         "counts": counts.cpu(),
         "metadata": metadata or {},
     }
+    if medoids is not None:
+        payload["medoids"] = medoids.cpu()
+    if medoid_image_paths is not None:
+        payload["medoid_image_paths"] = list(medoid_image_paths)
     torch.save(payload, path)
     logger.info(
-        "Saved place weights to %s (%d places, dim=%d)",
+        "Saved place weights to %s (%d places, dim=%d%s)",
         path,
         place_ids.numel(),
         centroids.shape[1],
+        ", with medoids" if medoids is not None else "",
     )
 
 
 def load_place_weights(
     path: Path,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    dict,
+    Optional[torch.Tensor],
+    Optional[List[str]],
+]:
     payload = torch.load(path, map_location="cpu", weights_only=False)
     place_sums = payload.get("place_sums")
     if place_sums is None:
@@ -251,6 +320,8 @@ def load_place_weights(
         place_sums,
         payload["counts"],
         payload.get("metadata", {}),
+        payload.get("medoids"),
+        payload.get("medoid_image_paths"),
     )
 
 
@@ -268,19 +339,34 @@ class PlaceCentroidTable:
         place_sums: torch.Tensor,
         centroids: Optional[torch.Tensor] = None,
         counts: Optional[torch.Tensor] = None,
+        medoids: Optional[torch.Tensor] = None,
+        medoid_image_paths: Optional[List[str]] = None,
     ):
         self.place_ids = place_ids.long()
         self.place_sums = place_sums.float()
         self.centroids = centroids.float() if centroids is not None else None
         self.counts = counts.long() if counts is not None else None
+        self.medoids = medoids.float() if medoids is not None else None
+        self.medoid_image_paths = (
+            list(medoid_image_paths) if medoid_image_paths is not None else None
+        )
         self._id_to_idx = {
             int(pid): i for i, pid in enumerate(self.place_ids.tolist())
         }
 
     @classmethod
     def from_file(cls, path: Path) -> "PlaceCentroidTable":
-        place_ids, centroids, place_sums, counts, _meta = load_place_weights(path)
-        return cls(place_ids, place_sums, centroids=centroids, counts=counts)
+        place_ids, centroids, place_sums, counts, _meta, medoids, medoid_paths = (
+            load_place_weights(path)
+        )
+        return cls(
+            place_ids,
+            place_sums,
+            centroids=centroids,
+            counts=counts,
+            medoids=medoids,
+            medoid_image_paths=medoid_paths,
+        )
 
     def _label_indices(self, labels: torch.Tensor) -> torch.Tensor:
         labels_list = labels.view(-1).tolist()
@@ -300,6 +386,15 @@ class PlaceCentroidTable:
         idx = self._label_indices(labels)
         sums = self.place_sums[idx].to(device=z.device, dtype=z.dtype)
         return F.normalize(sums - z, dim=-1)
+
+    def medoid_targets(self, z: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """vMF target: precomputed place medoid (medoid images are excluded from training)."""
+        if self.medoids is None:
+            raise ValueError(
+                "pre_weights file has no medoids; re-run pre_weights.py to rebuild weights."
+            )
+        idx = self._label_indices(labels)
+        return self.medoids[idx].to(device=z.device, dtype=z.dtype)
 
     def loo_targets(self, z: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         """Alias for :meth:`targets_excluding_query`."""
@@ -384,7 +479,7 @@ def _debug_main() -> None:
         ])
         dataset = _PlaceImageDataset(places_df, transform)
         loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
-        images, labels = next(iter(loader))
+        images, labels, _image_paths = next(iter(loader))
         with torch.no_grad():
             z = model(images.to(device))[0].cpu()
         targets = table.targets_excluding_query(z, labels)
@@ -404,7 +499,7 @@ def _debug_main() -> None:
     )
     _device, model = init_model(cfg)
     model = model.to(device)
-    place_ids, centroids, place_sums, counts = compute_place_centroids(
+    place_ids, centroids, place_sums, counts, medoids, medoid_image_paths = compute_place_centroids(
         model,
         device,
         places_df,
@@ -418,6 +513,8 @@ def _debug_main() -> None:
         centroids,
         place_sums,
         counts,
+        medoids=medoids,
+        medoid_image_paths=medoid_image_paths,
         metadata={"debug": True, "max_places": args.max_places},
     )
 

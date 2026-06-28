@@ -1,3 +1,4 @@
+import logging
 import multiprocessing as mp
 from pathlib import Path
 from typing import Any, Dict
@@ -7,10 +8,16 @@ from torch.utils.data.dataloader import DataLoader
 from torchvision import transforms as T
 
 from data.GSVCitiesDataset import GSVCitiesDataset
-from data.place_weights import GSVCitiesRandomImageDataset, load_places_csv
-from data.place_weights import PlaceCentroidTable
+from data.place_weights import (
+    GSVCitiesRandomImageDataset,
+    PlaceCentroidTable,
+    exclude_medoid_training_images,
+    load_places_csv,
+)
 from data.mixvpr_val_dataset import build_val_dataset, load_val_dataset_paths
 from prettytable import PrettyTable
+
+logger = logging.getLogger(__name__)
 
 IMAGENET_MEAN_STD = {"mean": [0.485, 0.456, 0.406], "std": [0.229, 0.224, 0.225]}
 
@@ -71,6 +78,7 @@ class GSVCitiesDataModule(pl.LightningDataModule):
         random_images=False,
         places_csv_path=None,
         pre_weights_path=None,
+        use_medoid_targets=False,
     ):
         super().__init__()
         self.batch_size = batch_size
@@ -93,6 +101,7 @@ class GSVCitiesDataModule(pl.LightningDataModule):
         self.random_images = bool(random_images)
         self.places_csv_path = places_csv_path
         self.pre_weights_path = pre_weights_path
+        self.use_medoid_targets = bool(use_medoid_targets)
         self.save_hyperparameters()
 
         self.train_transform = T.Compose([
@@ -155,10 +164,27 @@ class GSVCitiesDataModule(pl.LightningDataModule):
                 min_img_per_place=self.min_img_per_place,
             )
             place_ids = None
+            pre_weights = None
             if self.pre_weights_path:
-                place_ids = PlaceCentroidTable.from_file(
-                    Path(self.pre_weights_path)
-                ).place_ids.tolist()
+                pre_weights = PlaceCentroidTable.from_file(Path(self.pre_weights_path))
+                place_ids = pre_weights.place_ids.tolist()
+                if self.use_medoid_targets:
+                    if pre_weights.medoid_image_paths is None:
+                        raise ValueError(
+                            f"{self.pre_weights_path} has no medoid_image_paths; "
+                            "re-run pre_weights.py to rebuild weights."
+                        )
+                    n_before = len(places_df)
+                    places_df = exclude_medoid_training_images(
+                        places_df,
+                        pre_weights.medoid_image_paths,
+                    )
+                    logger.info(
+                        "Excluded %d medoid training images (%d -> %d rows)",
+                        n_before - len(places_df),
+                        n_before,
+                        len(places_df),
+                    )
             self.train_dataset = GSVCitiesRandomImageDataset(
                 places_df,
                 transform=self.train_transform,

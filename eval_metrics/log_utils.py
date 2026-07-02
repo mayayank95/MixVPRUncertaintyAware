@@ -37,11 +37,12 @@ def format_ece(ece_result: Optional[Dict]) -> str:
 def log_stats(prefix: str, stats: Dict[str, float], *, debug: bool = False) -> None:
     log_fn = logger.debug if debug else logger.info
     log_fn(
-        "  %s: min=%.4g, max=%.4g, mean=%.4g, median=%.4g",
+        "  %s: min=%.4g, max=%.4g, mean=%.4g, std=%.4g, median=%.4g",
         prefix,
         stats["min"],
         stats["max"],
         stats["mean"],
+        stats["std"],
         stats["median"],
     )
 
@@ -67,10 +68,11 @@ def log_metric_summary(
         log_stats("confidence (before clamp)", score_stats["confidence_before_clamp"], debug=True)
     else:
         logger.info(
-            "  variances (after clamp): min=%.4g, max=%.4g, mean=%.4g",
+            "  variances (after clamp): min=%.4g, max=%.4g, mean=%.4g, std=%.4g",
             float(np.min(scores)),
             float(np.max(scores)),
             float(np.mean(scores)),
+            float(np.std(scores)),
         )
     if auc_pr is not None:
         logger.info("  AUC-PR: %.4f", auc_pr)

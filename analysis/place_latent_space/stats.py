@@ -41,7 +41,7 @@ def encode_places_by_id(
     )
 
     by_place: Dict[int, List[torch.Tensor]] = {}
-    for images, place_ids in loader:
+    for images, place_ids, _ in loader:
         images = images.to(device, non_blocking=True)
         out = model(images)
         descriptors = out[0] if isinstance(out, tuple) else out

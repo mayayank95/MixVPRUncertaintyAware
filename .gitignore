@@ -9,6 +9,7 @@ LOGS/
 logs/
 cache/
 *.png
+*.csv
 *.html
 *.json
 !analysis/place_latent_space/presets/**/*.json

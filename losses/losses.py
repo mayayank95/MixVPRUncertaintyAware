@@ -2,8 +2,8 @@ import torch
 from pytorch_metric_learning import losses, miners
 from pytorch_metric_learning.distances import CosineSimilarity, DotProductSimilarity
 
+from losses.ms_constants import KAPPA_EPS, MS_BASE_MARGIN, MS_NEG_WEIGHT, MS_POS_WEIGHT
 from losses.vmf_loss import VMFLikelihood
-
 
 def _basic_loss(loss_name):
     if loss_name == "SupConLoss":
@@ -12,7 +12,10 @@ def _basic_loss(loss_name):
         return losses.CircleLoss(m=0.4, gamma=80)
     if loss_name == "MultiSimilarityLoss":
         return losses.MultiSimilarityLoss(
-            alpha=1.0, beta=50, base=0.0, distance=DotProductSimilarity()
+            alpha=MS_POS_WEIGHT,
+            beta=MS_NEG_WEIGHT,
+            base=MS_BASE_MARGIN,
+            distance=DotProductSimilarity(),
         )
     if loss_name == "ContrastiveLoss":
         return losses.ContrastiveLoss(pos_margin=0, neg_margin=1)
@@ -40,16 +43,25 @@ def get_loss(loss_name, active_losses, uncertainty_loss, descriptors_dimension=5
     Return (loss_basic, loss_uncertainty) for MixVPR training.
 
     active_losses: e.g. ["basic"], ["uncertainty"], or both (from --losses).
-    uncertainty_loss: "vmf" -> VMFLikelihood instance with d=descriptors_dimension.
+    uncertainty_loss: "vmf" -> VMFLikelihood; "kappa_ms" -> joint Margin-MS + R(kappa).
     """
+
     loss_basic = None
     loss_uncertainty = None
+    u = str(uncertainty_loss).lower()
+
+    if u == "kappa_ms":
+        if "uncertainty" not in active_losses:
+            raise ValueError("kappa_ms requires --losses uncertainty")
+        from losses.kappa_ms_loss import KappaMSLoss
+
+        loss_uncertainty = KappaMSLoss(d=int(descriptors_dimension))
+        return loss_basic, loss_uncertainty
 
     if "basic" in active_losses:
         loss_basic = _basic_loss(loss_name)
 
     if "uncertainty" in active_losses:
-        u = str(uncertainty_loss).lower()
         if u == "vmf":
             loss_uncertainty = VMFLikelihood(d=int(descriptors_dimension))
         elif u == "gaussian_nll":

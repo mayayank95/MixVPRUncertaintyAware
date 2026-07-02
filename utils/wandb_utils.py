@@ -37,6 +37,7 @@ _UNCERTAINTY_LOSS_NAME_SHORT = {
     "gaussian_nll": "gnll",
     "gaussian_cosine": "gcos",
     "vmf": "vmf",
+    "kappa_ms": "kms",
 }
 
 _EARLY_STOP_NAME_SHORT = {

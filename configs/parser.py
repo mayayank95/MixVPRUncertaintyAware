@@ -136,6 +136,12 @@ def parse_args() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
                    help="Lightning sanity validation steps before training (train.py)")
     p.add_argument("--check_val_every_n_epoch", type=int, default=1,
                    help="Run validation every N epochs (train.py)")
+    p.add_argument(
+        "--limit_train_batches",
+        type=int,
+        default=None,
+        help="Lightning: max training batches per epoch (debug). Omit for full epoch.",
+    )
 
     # MixVPR (train.py) — data
     p.add_argument(
@@ -225,17 +231,6 @@ def parse_args() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
         default=None,
         help="When basic is enabled: MultiSimilarityLoss, CircleLoss, TripletMarginLoss, etc.",
     )
-    p.add_argument(
-        "--mixvpr_uncertainty_loss_type",
-        type=str,
-        default=None,
-        help="When uncertainty is enabled: vmf, gaussian_nll, gaussian_cosine, vmf_place "
-        "(default: --uncertainty_loss)",
-    )
-    p.add_argument("--mixvpr_basic_loss_weight", type=float, default=1.0,
-                   help="Weight for basic (metric-learning) loss")
-    p.add_argument("--mixvpr_uncertainty_loss_weight", type=float, default=None,
-                   help="Weight for uncertainty loss (default: --uncertainty_lambda)")
     p.add_argument("--mixvpr_loss_name", type=str, default="MultiSimilarityLoss",
                    help="Alias for --mixvpr_basic_loss_type if that flag is omitted")
     p.add_argument("--mixvpr_miner_name", type=str, default="MultiSimilarityMiner",
@@ -273,9 +268,11 @@ def parse_args() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
 
     # Uncertainty
     p.add_argument("--model_mode", type=str, default="basic", help="Model mode: basic or uncertainty")
-    p.add_argument("--uncertainty_lambda", type=float, default=1.0, help="Weight for the uncertainty loss")
+    p.add_argument("--uncertainty_lambda", type=float, default=1.0,
+        help="vMF: weight on full NLL. kappa_ms: weight on R(kappa) only (MS terms unweighted).")
     p.add_argument("--uncertainty_loss", type=str, default="vmf",
-        help="Uncertainty loss type: gaussian_nll, gaussian_cosine, or vmf")
+        help="Uncertainty loss type: gaussian_nll, gaussian_cosine, vmf, or kappa_ms "
+        "(joint Margin-MS + vMF log-partition regularizer)")
     p.add_argument("--gnll_mu_scale_mode", type=str, default="sqrt_dim", choices=["sqrt_dim", "none", "custom"],
         help="Scaling mode for Gaussian NLL mean vectors: sqrt_dim (default), none (1.0), or custom (use --gnll_mu_scale_value).")
     p.add_argument("--gnll_mu_scale_value", type=float, default=1.0,
@@ -410,10 +407,6 @@ def normalize(merged: Dict[str, Any]) -> Dict[str, Any]:
 
     if out.get("mixvpr_basic_loss_type") is None and out.get("mixvpr_loss_name") is not None:
         out["mixvpr_basic_loss_type"] = out["mixvpr_loss_name"]
-    if out.get("mixvpr_uncertainty_loss_weight") is None:
-        out["mixvpr_uncertainty_loss_weight"] = out.get("uncertainty_lambda", 1.0)
-    if out.get("mixvpr_uncertainty_loss_type") is None and out.get("uncertainty_loss") is not None:
-        out["mixvpr_uncertainty_loss_type"] = out["uncertainty_loss"]
 
     if "ece_metrics" in out and out["ece_metrics"] is not None:
         v = out["ece_metrics"]
@@ -474,7 +467,7 @@ def normalize(merged: Dict[str, Any]) -> Dict[str, Any]:
         out["recall_values"] = merged_rv
 
     # Validate phased early stop
-    if out.get("phased_early_stop"):
+    if out.get("phased_early_stop") and not out.get("disable_early_stop"):
         es = out["early_stop_metrics"]
         has_ece = any(m.startswith("ece_recall_") for m in es)
         if not has_ece:
@@ -494,6 +487,19 @@ def normalize(merged: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("use_pre_weights requires --pre_weights_path")
     if out.get("mixvpr_random_images") and not out.get("places_csv_path"):
         raise ValueError("mixvpr_random_images requires --places_csv_path")
+
+    if out.get("check_val_every_n_epoch", 1) < 1:
+        raise ValueError("check_val_every_n_epoch must be >= 1 (Lightning crashes on 0)")
+
+    u_loss = str(out.get("uncertainty_loss", "vmf")).lower()
+    if u_loss == "kappa_ms":
+        losses_list = out.get("losses") or []
+        if isinstance(losses_list, str):
+            losses_list = [s.strip() for s in losses_list.split(",") if s.strip()]
+        if "uncertainty" not in losses_list:
+            raise ValueError("uncertainty_loss=kappa_ms requires --losses uncertainty")
+        if out.get("model_mode") != "uncertainty":
+            raise ValueError("uncertainty_loss=kappa_ms requires model_mode=uncertainty")
 
     out["var_head_agg"] = bool(out.get("var_head_agg", False))
     out["var_head_linear"] = str(out.get("var_head_linear", "d")).lower()

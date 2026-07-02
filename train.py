@@ -60,9 +60,10 @@ class VPRModel(pl.LightningModule):
         uncertainty_loss = cfg["uncertainty_loss"]
         active_losses = cfg["losses"]
         uncertainty_lambda = cfg["uncertainty_lambda"]
+        self._use_kappa_ms = str(uncertainty_loss).lower() == "kappa_ms"
 
         miner_name = cfg.get("mixvpr_miner_name") or ""
-        if "basic" not in active_losses:
+        if "basic" not in active_losses and not self._use_kappa_ms:
             miner_name = ""
         self.loss_name = loss_name
         self.miner_name = miner_name
@@ -209,6 +210,8 @@ class VPRModel(pl.LightningModule):
         optimizer.step(closure=optimizer_closure)
 
     def _uncertainty_loss(self, descriptors, labels, variances):
+        if self._use_kappa_ms:
+            return self._kappa_ms_loss(descriptors, labels, variances)
         if self._place_centroids is not None:
             if self._use_medoid_targets:
                 targets = self._place_centroids.medoid_targets(descriptors, labels)
@@ -220,11 +223,32 @@ class VPRModel(pl.LightningModule):
         kappa = variances.mean(dim=-1, keepdim=True)
         return self.uncertainty_lambda * self.loss_uncertainty(descriptors, kappa, targets)
 
+    def _kappa_ms_loss(self, descriptors, labels, variances, indices_tuple=None, return_parts=False):
+        """MS-vMF: uncertainty_lambda scales R(kappa) only; MS terms unweighted."""
+        kappa = variances.mean(dim=-1, keepdim=True)
+        return self.loss_uncertainty(
+            descriptors,
+            labels,
+            kappa,
+            indices_tuple=indices_tuple,
+            reg_weight=self.uncertainty_lambda,
+            return_parts=return_parts,
+        )
+
     def loss_function(self, descriptors, labels, variances=None):
         loss = torch.tensor(0.0, device=descriptors.device, dtype=descriptors.dtype)
         batch_acc = 0.0
 
-        if self.miner is not None:
+        if self._use_kappa_ms:
+            if variances is None:
+                raise ValueError("kappa_ms loss requires model_mode=uncertainty (variances)")
+            indices_tuple = self.miner(descriptors, labels) if self.miner is not None else None
+            loss = self._kappa_ms_loss(descriptors, labels, variances, indices_tuple)
+            if self.miner is not None and indices_tuple is not None:
+                nb_samples = descriptors.shape[0]
+                nb_mined = len(set(indices_tuple[0].detach().cpu().numpy()))
+                batch_acc = 1.0 - (nb_mined / nb_samples)
+        elif self.miner is not None:
             miner_outputs = self.miner(descriptors, labels)
             if self.loss_basic is not None:
                 loss = loss + self.loss_basic(descriptors, labels, miner_outputs)
@@ -622,7 +646,7 @@ if __name__ == "__main__":
 
     use_gpu = cfg["device"] == "cuda"
     default_root_dir = str(Path(cfg.get("log_dir") or cfg.get("logs_folder", "logs/MixVPR")))
-    trainer = pl.Trainer(
+    trainer_kwargs = dict(
         accelerator="gpu" if use_gpu else "cpu",
         devices=1 if use_gpu else "auto",
         default_root_dir=default_root_dir,
@@ -634,6 +658,9 @@ if __name__ == "__main__":
         reload_dataloaders_every_n_epochs=1 if cfg["reload_dataloaders"] else 0,
         log_every_n_steps=cfg["log_every_n_steps"],
     )
+    if cfg.get("limit_train_batches") is not None:
+        trainer_kwargs["limit_train_batches"] = cfg["limit_train_batches"]
+    trainer = pl.Trainer(**trainer_kwargs)
 
     if cfg.get("validate_before_fit"):
         print("\n>>> Validation BEFORE training\n")

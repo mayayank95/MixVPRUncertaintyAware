@@ -8,7 +8,11 @@ import torch
 
 from data.test_dataset import TestDataset
 from eval_metrics import visualizations
-from eval_metrics.eval_ece_sh import compute_ece, compute_ece_pairwise
+from eval_metrics.eval_ece_sh import (
+    compute_ece,
+    compute_ece_pairwise,
+    vmf_like_uncertainty_loss,
+)
 from eval_metrics.eval_wandb import build_eval_outputs
 from eval_metrics.extraction import extract_descriptors
 from eval_metrics.joint_kappa import compute_joint_kappa
@@ -75,7 +79,9 @@ def _compute_uncertainty_block(
         if save_plots:
             dataset_output_dir.mkdir(parents=True, exist_ok=True)
 
-        is_vmf = args.get("uncertainty_loss", "gaussian_nll").lower() == "vmf"
+        loss_type = args.get("uncertainty_loss", "gaussian_nll")
+        is_vmf = str(loss_type).lower() == "vmf"
+        is_vmf_like = vmf_like_uncertainty_loss(loss_type)
         ece_variants = [("kappa", q_var, "ece_kappa.png")]
 
         if is_vmf:
@@ -132,11 +138,7 @@ def _compute_uncertainty_block(
             logger.debug("Computing detailed uncertainty AUC-PR...")
             uncertainty_aucpr = {}
             auc_pr_variants = [
-                (
-                    "kappa",
-                    kappa_per_query,
-                    args.get("uncertainty_loss", "gaussian_nll").lower() == "vmf",
-                )
+                ("kappa", kappa_per_query, is_vmf_like),
             ]
             if is_vmf:
                 auc_pr_variants.append(("joint_kappa", joint_kappa[:, 0], True))

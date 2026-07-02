@@ -19,6 +19,26 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+
+def vmf_like_uncertainty_loss(uncertainty_loss: str) -> bool:
+    """vMF and kappa_ms both use softplus κ where higher = more confident."""
+    return str(uncertainty_loss).lower() in ("vmf", "kappa_ms")
+
+
+def mean_query_uncertainty(
+    query_variances: np.ndarray,
+    uncertainty_loss: str,
+    vmf_kappa_floor: bool = False,
+) -> np.ndarray:
+    """Per-query scalar uncertainty (higher = more uncertain)."""
+    mu = np.mean(query_variances, axis=-1)
+    if vmf_like_uncertainty_loss(uncertainty_loss):
+        if vmf_kappa_floor:
+            mu = np.maximum(mu, 1.0)
+        return 1.0 / (mu + 1e-6)
+    return mu
+
+
 # ``percentile_two_sided`` is selected per-call by the caller (via the ``--ece_two_sided``
 # config flag for learned heads; baselines always pass False explicitly).
 PERCENTILE_CLIP_PCT = 1.0  # clip 1% tail(s): two-sided → [p1, p99]; one-sided → hi at p99
@@ -136,6 +156,7 @@ def _score_summary(values: np.ndarray) -> Dict[str, float]:
         "min": float(np.min(values)),
         "max": float(np.max(values)),
         "mean": float(np.mean(values)),
+        "std": float(np.std(values)),
         "median": float(np.median(values)),
     }
 
@@ -269,15 +290,13 @@ def compute_ece(
     logger.debug(f"compute_ece: Saving {plot_filename} to {output_dir}")
     variances_before_clamp = np.mean(query_variances, axis=-1)
     variances_after_clamp = variances_before_clamp
-    mean_var = variances_after_clamp
-    
-    # For vMF, query_variances are concentration (kappa). 
-    # Large kappa = High confidence (Low uncertainty).
-    # We invert it to match the "higher value = higher uncertainty" logic of Gaussian variance.
-    if uncertainty_loss.lower() == "vmf":
-        if vmf_kappa_floor:
-            variances_after_clamp = np.maximum(variances_before_clamp, 1.0)
-        mean_var = 1.0 / (variances_after_clamp + 1e-6)
+    mean_var = mean_query_uncertainty(
+        query_variances,
+        uncertainty_loss,
+        vmf_kappa_floor=vmf_kappa_floor,
+    )
+    if vmf_like_uncertainty_loss(uncertainty_loss):
+        variances_after_clamp = np.maximum(variances_before_clamp, 1.0) if vmf_kappa_floor else variances_before_clamp
         
     bin_indices, zoom_k, clip_stats = _select_bins(
         mean_var, num_bins, bin_mode,
@@ -524,7 +543,7 @@ def _pair_scores_to_uncertainty(pair_scores: np.ndarray, uncertainty_loss: str,
                                 vmf_kappa_floor: bool) -> np.ndarray:
     """Map raw pair scores to ``uncertainty`` (higher = more uncertain), shape preserved."""
     ps = pair_scores.astype(np.float64, copy=False)
-    if uncertainty_loss.lower() == "vmf":
+    if vmf_like_uncertainty_loss(uncertainty_loss):
         # Joint-kappa S / concentration-like scores: higher score → more confident.
         # vmf_kappa_floor applies to κ-like inputs; for resultant S it is usually left False.
         if vmf_kappa_floor:
@@ -590,7 +609,7 @@ def compute_ece_pairwise(
 
     variances_before_clamp = pair_scores.astype(np.float64, copy=False)
     variances_after_clamp = variances_before_clamp
-    if uncertainty_loss.lower() == "vmf" and vmf_kappa_floor:
+    if vmf_like_uncertainty_loss(uncertainty_loss) and vmf_kappa_floor:
         variances_after_clamp = np.maximum(variances_before_clamp, 1.0)
     U = _pair_scores_to_uncertainty(pair_scores, uncertainty_loss, vmf_kappa_floor)
     num_actual_bins = num_bins - 1

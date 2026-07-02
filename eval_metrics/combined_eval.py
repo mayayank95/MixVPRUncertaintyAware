@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-from eval_metrics.eval_ece_sh import compute_ece, compute_ece_pairwise
+from eval_metrics.eval_ece_sh import compute_ece, compute_ece_pairwise, vmf_like_uncertainty_loss
 from eval_metrics.failure_prediction import combined_failure_prediction_pr_auc
 from eval_metrics.log_utils import log_combined_panel
 from eval_metrics.uncertainty import compute_score_statistics
@@ -129,7 +129,7 @@ def compute_and_log_combined(
             dtype=np.float64,
         )
         mean_var_shard = np.mean(d["q_var"], axis=-1)
-        kconf_shard = mean_var_shard if uncertainty_loss.lower() == "vmf" else -mean_var_shard
+        kconf_shard = mean_var_shard if vmf_like_uncertainty_loss(uncertainty_loss) else -mean_var_shard
         kappa_sh_matched.append(matched_vec)
         kappa_sh_conf.append(kconf_shard)
 

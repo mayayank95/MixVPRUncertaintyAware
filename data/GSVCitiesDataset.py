@@ -1,11 +1,17 @@
 # https://github.com/amaralibey/gsv-cities
 
-import pandas as pd
+import logging
 from pathlib import Path
+
+import pandas as pd
 from PIL import Image
 import torch
 from torch.utils.data import Dataset
 import torchvision.transforms as T
+
+from data.medoid_exclusion import exclude_medoid_training_images
+
+logger = logging.getLogger(__name__)
 
 default_transform = T.Compose([
     T.ToTensor(),
@@ -28,6 +34,10 @@ class GSVCitiesDataset(Dataset):
                  transform=default_transform,
                  base_path=BASE_PATH,
                  sfxl_train_root=None,
+                 allowed_place_ids=None,
+                 medoid_path_by_place=None,
+                 medoid_transform=None,
+                 max_train_places=0,
                  ):
         super(GSVCitiesDataset, self).__init__()
         self.base_path = base_path
@@ -40,13 +50,34 @@ class GSVCitiesDataset(Dataset):
         self.min_img_per_place = min_img_per_place
         self.random_sample_from_each_place = random_sample_from_each_place
         self.transform = transform
+        self.allowed_place_ids = (
+            {int(pid) for pid in allowed_place_ids}
+            if allowed_place_ids is not None
+            else None
+        )
+        self.medoid_path_by_place = dict(medoid_path_by_place or {})
+        self.medoid_transform = medoid_transform
         
-        # generate the dataframe contraining images metadata
+        # Load CSVs → resolve paths → exclude medoids (before place filtering / sampling).
         self.dataframe = self.__getdataframes()
         self._has_rel_path = "sfxl_rel_path" in self.dataframe.columns
-        
-        # get all unique place ids
+        self.dataframe = self._attach_image_paths(self.dataframe)
+        self.dataframe = exclude_medoid_training_images(
+            self.dataframe,
+            self.medoid_path_by_place.values(),
+            log=logger,
+        )
+
         self.places_ids = pd.unique(self.dataframe.index)
+        if self.allowed_place_ids is not None:
+            self.places_ids = [
+                pid for pid in self.places_ids if int(pid) in self.allowed_place_ids
+            ]
+        if max_train_places > 0:
+            self.places_ids = self.places_ids[:max_train_places]
+            keep = {int(pid) for pid in self.places_ids}
+            self.dataframe = self.dataframe[self.dataframe.index.isin(keep)]
+            logger.info("Debug: capped training to %d places", len(self.places_ids))
         self.total_nb_images = len(self.dataframe)
         
     def __getdataframes(self):
@@ -90,6 +121,17 @@ class GSVCitiesDataset(Dataset):
         
         # get the place in form of a dataframe (each row corresponds to one image)
         place = self.dataframe.loc[place_id]
+        if isinstance(place, pd.Series):
+            place = place.to_frame().T
+
+        # Medoid rows are excluded once in __init__; here we only need the path
+        # (when medoid_transform is set) to load the target image for live encoding.
+        medoid_path = self.medoid_path_by_place.get(int(place_id))
+        if len(place) < self.img_per_place:
+            raise ValueError(
+                f"place_id={place_id}: only {len(place)} train images after medoid exclusion, "
+                f"need img_per_place={self.img_per_place} (raise min_img_per_place)."
+            )
         
         # sample K images (rows) from this place
         # we can either sort and take the most recent k images
@@ -111,11 +153,20 @@ class GSVCitiesDataset(Dataset):
 
             imgs.append(img)
 
-        # NOTE: contrary to image classification where __getitem__ returns only one image 
+        labels = torch.tensor(place_id).repeat(self.img_per_place)
+        if self.medoid_transform is not None:
+            if medoid_path is None:
+                raise ValueError(
+                    f"place_id={place_id}: medoid_transform set but no medoid path"
+                )
+            medoid_img = self.medoid_transform(self.image_loader(medoid_path))
+            return torch.stack(imgs), labels, medoid_img
+
+        # NOTE: contrary to image classification where __getitem__ returns only one image
         # in GSVCities, we return a place, which is a Tesor of K images (K=self.img_per_place)
-        # this will return a Tensor of shape [K, channels, height, width]. This needs to be taken into account 
+        # this will return a Tensor of shape [K, channels, height, width]. This needs to be taken into account
         # in the Dataloader (which will yield batches of shape [BS, K, channels, height, width])
-        return torch.stack(imgs), torch.tensor(place_id).repeat(self.img_per_place)
+        return torch.stack(imgs), labels
 
     def __len__(self):
         '''Denotes the total number of places (not images)'''
@@ -133,6 +184,13 @@ class GSVCitiesDataset(Dataset):
             return str(Path(self.sfxl_train_root) / row["sfxl_rel_path"])
         img_name = self.get_img_name(row)
         return str(Path(self.base_path) / 'Images' / row['city_id'] / img_name)
+
+    def _attach_image_paths(self, dataframe: pd.DataFrame) -> pd.DataFrame:
+        out = dataframe.copy()
+        out["image_path"] = [
+            self._resolve_image_path(row) for _, row in out.iterrows()
+        ]
+        return out
 
     @staticmethod
     def get_img_name(row):

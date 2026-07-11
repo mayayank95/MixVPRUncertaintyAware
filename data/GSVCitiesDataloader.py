@@ -1,7 +1,7 @@
 import logging
 import multiprocessing as mp
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import pytorch_lightning as pl
 from torch.utils.data.dataloader import DataLoader
@@ -11,7 +11,6 @@ from data.GSVCitiesDataset import GSVCitiesDataset
 from data.place_weights import (
     GSVCitiesRandomImageDataset,
     PlaceCentroidTable,
-    exclude_medoid_training_images,
     load_places_csv,
 )
 from data.mixvpr_val_dataset import build_val_dataset, load_val_dataset_paths
@@ -78,7 +77,10 @@ class GSVCitiesDataModule(pl.LightningDataModule):
         random_images=False,
         places_csv_path=None,
         pre_weights_path=None,
+        place_centroids: Optional[PlaceCentroidTable] = None,
         use_medoid_targets=False,
+        medoid_live_targets=False,
+        max_train_places=0,
     ):
         super().__init__()
         self.batch_size = batch_size
@@ -101,8 +103,11 @@ class GSVCitiesDataModule(pl.LightningDataModule):
         self.random_images = bool(random_images)
         self.places_csv_path = places_csv_path
         self.pre_weights_path = pre_weights_path
+        self.place_centroids = place_centroids
         self.use_medoid_targets = bool(use_medoid_targets)
-        self.save_hyperparameters()
+        self.medoid_live_targets = bool(medoid_live_targets)
+        self.max_train_places = int(max_train_places)
+        self.save_hyperparameters(ignore=["place_centroids"])
 
         self.train_transform = T.Compose([
             T.Resize(image_size, interpolation=T.InterpolationMode.BILINEAR),
@@ -155,6 +160,18 @@ class GSVCitiesDataModule(pl.LightningDataModule):
             if self.show_data_stats:
                 self.print_stats()
 
+    def _resolve_place_centroids(self) -> Optional[PlaceCentroidTable]:
+        if self.place_centroids is not None:
+            return self.place_centroids
+        if not self.pre_weights_path:
+            return None
+        self.place_centroids = PlaceCentroidTable.from_file(
+            Path(self.pre_weights_path),
+            use_medoid_targets=self.use_medoid_targets,
+            medoid_live_targets=self.medoid_live_targets,
+        )
+        return self.place_centroids
+
     def reload(self):
         if self.random_images:
             if not self.places_csv_path:
@@ -164,31 +181,17 @@ class GSVCitiesDataModule(pl.LightningDataModule):
                 min_img_per_place=self.min_img_per_place,
             )
             place_ids = None
-            pre_weights = None
-            if self.pre_weights_path:
-                pre_weights = PlaceCentroidTable.from_file(Path(self.pre_weights_path))
+            medoid_image_paths = None
+            pre_weights = self._resolve_place_centroids()
+            if pre_weights is not None:
                 place_ids = pre_weights.place_ids.tolist()
                 if self.use_medoid_targets:
-                    if pre_weights.medoid_image_paths is None:
-                        raise ValueError(
-                            f"{self.pre_weights_path} has no medoid_image_paths; "
-                            "re-run pre_weights.py to rebuild weights."
-                        )
-                    n_before = len(places_df)
-                    places_df = exclude_medoid_training_images(
-                        places_df,
-                        pre_weights.medoid_image_paths,
-                    )
-                    logger.info(
-                        "Excluded %d medoid training images (%d -> %d rows)",
-                        n_before - len(places_df),
-                        n_before,
-                        len(places_df),
-                    )
+                    medoid_image_paths = pre_weights.medoid_image_paths
             self.train_dataset = GSVCitiesRandomImageDataset(
                 places_df,
                 transform=self.train_transform,
                 place_ids=place_ids,
+                medoid_image_paths=medoid_image_paths,
             )
             return
 
@@ -197,12 +200,40 @@ class GSVCitiesDataModule(pl.LightningDataModule):
             kwargs["base_path"] = self.base_path
         if self.sfxl_train_root is not None:
             kwargs["sfxl_train_root"] = self.sfxl_train_root
+
+        allowed_place_ids = None
+        medoid_path_by_place = None
+        pre_weights = self._resolve_place_centroids()
+        if pre_weights is not None:
+            allowed_place_ids = pre_weights.place_ids.tolist()
+            if self.use_medoid_targets:
+                medoid_path_by_place = pre_weights.medoid_path_by_place
+                logger.info(
+                    "Place-based training: restrict to %d pre_weight places "
+                    "(medoid targets enabled)",
+                    len(allowed_place_ids),
+                )
+                if self.medoid_live_targets:
+                    logger.info(
+                        "Medoid-live: load medoid images in DataLoader workers "
+                        "(num_workers=%d)",
+                        self.num_workers,
+                    )
+
         self.train_dataset = GSVCitiesDataset(
             cities=self.cities,
             img_per_place=self.img_per_place,
             min_img_per_place=self.min_img_per_place,
             random_sample_from_each_place=self.random_sample_from_each_place,
             transform=self.train_transform,
+            allowed_place_ids=allowed_place_ids,
+            medoid_path_by_place=medoid_path_by_place,
+            medoid_transform=(
+                self.valid_transform
+                if self.medoid_live_targets and not self.random_images
+                else None
+            ),
+            max_train_places=self.max_train_places,
             **kwargs,
         )
 

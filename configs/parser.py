@@ -182,6 +182,12 @@ def parse_args() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
         "Default: 23 GSV TRAIN_CITIES.",
     )
     p.add_argument(
+        "--max_train_places",
+        type=int,
+        default=0,
+        help="Debug: keep only the first N training places after load (0 = all). P×K only.",
+    )
+    p.add_argument(
         "--use_pre_weights",
         action="store_true",
         help="Load full-place offline weights (all images/place); LOO target built at train time.",
@@ -189,8 +195,17 @@ def parse_args() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
     p.add_argument(
         "--use_medoid_targets",
         action="store_true",
-        help="With --use_pre_weights: use precomputed place medoid "
-        "(argmax_j sum_k z_j^T z_k) as vMF target and exclude medoid images from training.",
+        help="With --use_pre_weights: use place medoid as vMF target and exclude medoid images "
+        "from training. Default: frozen offline medoid embedding; with --medoid_live_targets "
+        "re-encode medoid images each step.",
+    )
+    p.add_argument(
+        "--medoid_live_targets",
+        action="store_true",
+        help="With --use_medoid_targets: vMF target = current-model embedding of the offline-"
+        "selected medoid image (path/index fixed; descriptor updates during joint training). "
+        "Works with standard P×K place batches (batch_size places × img_per_place images) "
+        "or flat --mixvpr_random_images.",
     )
     p.add_argument(
         "--pre_weights_path",
@@ -482,6 +497,26 @@ def normalize(merged: Dict[str, Any]) -> Dict[str, Any]:
 
     if out.get("use_medoid_targets") and not out.get("use_pre_weights"):
         raise ValueError("use_medoid_targets requires --use_pre_weights")
+
+    if out.get("medoid_live_targets") and not out.get("use_medoid_targets"):
+        raise ValueError("medoid_live_targets requires --use_medoid_targets")
+
+    if out.get("medoid_live_targets"):
+        losses_list = out.get("losses") or []
+        if isinstance(losses_list, str):
+            losses_list = [s.strip() for s in losses_list.split(",") if s.strip()]
+        if "uncertainty" not in losses_list:
+            raise ValueError("medoid_live_targets requires --losses to include uncertainty")
+        if out.get("freeze_model"):
+            raise ValueError(
+                "medoid_live_targets requires joint training (omit --freeze_model) so medoid "
+                "embeddings can update with the backbone."
+            )
+        if out.get("mixvpr_random_images"):
+            raise ValueError(
+                "medoid_live_targets requires P×K place batching (omit --mixvpr_random_images); "
+                "medoid images must be loaded in GSVCitiesDataset.__getitem__."
+            )
 
     if out.get("use_pre_weights") and not out.get("pre_weights_path"):
         raise ValueError("use_pre_weights requires --pre_weights_path")

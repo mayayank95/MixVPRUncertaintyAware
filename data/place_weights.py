@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms as T
 
 from data.GSVCitiesDataset import GSVCitiesDataset
+from data.medoid_exclusion import exclude_medoid_training_images
 
 logger = logging.getLogger(__name__)
 
@@ -114,8 +115,13 @@ class GSVCitiesRandomImageDataset(Dataset):
         places_df: pd.DataFrame,
         transform: Optional[T.Compose] = None,
         place_ids: Optional[Sequence[int]] = None,
+        medoid_image_paths: Optional[Sequence[str]] = None,
     ):
-        df = places_df
+        df = exclude_medoid_training_images(
+            places_df,
+            medoid_image_paths,
+            log=logger,
+        )
         if place_ids is not None:
             df = filter_places_to_ids(df, place_ids)
         if df.empty:
@@ -132,15 +138,6 @@ class GSVCitiesRandomImageDataset(Dataset):
         if self.transform is not None:
             img = self.transform(img)
         return img, int(row["place_id"])
-
-
-def exclude_medoid_training_images(
-    places_df: pd.DataFrame,
-    medoid_image_paths: Sequence[str],
-) -> pd.DataFrame:
-    """Drop medoid rows from the training index."""
-    exclude = set(medoid_image_paths)
-    return places_df[~places_df["image_path"].isin(exclude)].copy().reset_index(drop=True)
 
 
 class _PlaceImageDataset(Dataset):
@@ -286,12 +283,29 @@ def save_place_weights(
         payload["medoid_image_paths"] = list(medoid_image_paths)
     torch.save(payload, path)
     logger.info(
-        "Saved place weights to %s (%d places, dim=%d%s)",
+        "Saved place weights to %s (%d places, dim=%d%s%s)",
         path,
         place_ids.numel(),
         centroids.shape[1],
         ", with medoids" if medoids is not None else "",
+        ", medoid index only" if medoids is None and medoid_image_paths is not None else "",
     )
+
+
+def _load_pre_weights_payload(path: Path) -> dict:
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def _place_sums_from_payload(payload: dict) -> torch.Tensor:
+    place_sums = payload.get("place_sums")
+    if place_sums is None:
+        place_sums = payload.get("descriptor_sums")
+    if place_sums is None:
+        raise ValueError(
+            "pre_weights file is missing place_sums; rebuild with pre_weights.py "
+            "(full-place aggregates over all images, LOO at train time)."
+        )
+    return place_sums
 
 
 def load_place_weights(
@@ -305,19 +319,12 @@ def load_place_weights(
     Optional[torch.Tensor],
     Optional[List[str]],
 ]:
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    place_sums = payload.get("place_sums")
-    if place_sums is None:
-        place_sums = payload.get("descriptor_sums")
-    if place_sums is None:
-        raise ValueError(
-            f"{path} is missing place_sums; rebuild with pre_weights.py "
-            "(full-place aggregates over all images, LOO at train time)."
-        )
+    """Load every field from a pre_weights file (for debug / offline tools)."""
+    payload = _load_pre_weights_payload(path)
     return (
         payload["place_ids"],
         payload["centroids"],
-        place_sums,
+        _place_sums_from_payload(payload),
         payload["counts"],
         payload.get("metadata", {}),
         payload.get("medoids"),
@@ -326,24 +333,25 @@ def load_place_weights(
 
 
 class PlaceCentroidTable:
-    """Full-place offline weights (all images per place).
+    """Precomputed per-place data for training.
 
-    Nothing is stored per query. At training time, vMF targets exclude the
-    current query descriptor from the place aggregate, mirroring
-    ``place_centroid_targets`` (``normalize(place_sum - query)``).
+    Only fields required by the active target mode are retained after loading
+    (e.g. medoid-live keeps place ids + medoid paths; centroid LOO keeps
+    place_sums). Large descriptor tensors are dropped so they can be freed.
     """
 
     def __init__(
         self,
         place_ids: torch.Tensor,
-        place_sums: torch.Tensor,
+        *,
+        place_sums: Optional[torch.Tensor] = None,
         centroids: Optional[torch.Tensor] = None,
         counts: Optional[torch.Tensor] = None,
         medoids: Optional[torch.Tensor] = None,
         medoid_image_paths: Optional[List[str]] = None,
     ):
         self.place_ids = place_ids.long()
-        self.place_sums = place_sums.float()
+        self.place_sums = place_sums.float() if place_sums is not None else None
         self.centroids = centroids.float() if centroids is not None else None
         self.counts = counts.long() if counts is not None else None
         self.medoids = medoids.float() if medoids is not None else None
@@ -353,20 +361,110 @@ class PlaceCentroidTable:
         self._id_to_idx = {
             int(pid): i for i, pid in enumerate(self.place_ids.tolist())
         }
+        self._medoid_path_by_place: Dict[int, str] = {}
+        if self.medoid_image_paths is not None:
+            for pid, path in zip(self.place_ids.tolist(), self.medoid_image_paths):
+                self._medoid_path_by_place[int(pid)] = path
 
     @classmethod
-    def from_file(cls, path: Path) -> "PlaceCentroidTable":
-        place_ids, centroids, place_sums, counts, _meta, medoids, medoid_paths = (
-            load_place_weights(path)
-        )
-        return cls(
+    def from_file(
+        cls,
+        path: Path,
+        *,
+        use_medoid_targets: bool = False,
+        medoid_live_targets: bool = False,
+        load_all: bool = False,
+    ) -> "PlaceCentroidTable":
+        """Load pre_weights, keeping only fields needed for the training mode."""
+        payload = _load_pre_weights_payload(path)
+        place_ids = payload["place_ids"]
+
+        place_sums = None
+        centroids = None
+        counts = None
+        medoids = None
+        medoid_paths = None
+        kept: List[str] = ["place_ids"]
+
+        if load_all:
+            place_sums = _place_sums_from_payload(payload)
+            centroids = payload.get("centroids")
+            counts = payload.get("counts")
+            medoids = payload.get("medoids")
+            medoid_paths = payload.get("medoid_image_paths")
+            kept.extend(["place_sums", "centroids", "counts", "medoids", "medoid_image_paths"])
+        elif use_medoid_targets:
+            medoid_paths = payload.get("medoid_image_paths")
+            kept.append("medoid_image_paths")
+            if not medoid_live_targets:
+                medoids = payload.get("medoids")
+                kept.append("medoids")
+        else:
+            place_sums = _place_sums_from_payload(payload)
+            kept.append("place_sums")
+
+        del payload
+
+        table = cls(
             place_ids,
-            place_sums,
+            place_sums=place_sums,
             centroids=centroids,
             counts=counts,
             medoids=medoids,
             medoid_image_paths=medoid_paths,
         )
+        logger.info(
+            "Loaded pre_weights %s: %d places, retained %s",
+            path,
+            table.place_ids.numel(),
+            ", ".join(kept),
+        )
+        return table
+
+    def validate_for_training(
+        self,
+        *,
+        use_medoid_targets: bool,
+        medoid_live_targets: bool,
+        path: Optional[Path] = None,
+    ) -> str:
+        """Check required fields for the chosen target mode; return target kind for logging."""
+        if medoid_live_targets:
+            target_kind = "medoid-live"
+        elif use_medoid_targets:
+            target_kind = "medoid"
+        else:
+            target_kind = "centroid"
+        path_hint = f" in {path}" if path is not None else ""
+        if use_medoid_targets and self.medoid_image_paths is None:
+            raise ValueError(
+                f"pre_weights{path_hint} has no medoid_image_paths; "
+                "re-run pre_weights.py to rebuild weights."
+            )
+        if (
+            use_medoid_targets
+            and not medoid_live_targets
+            and self.medoids is None
+        ):
+            raise ValueError(
+                f"pre_weights{path_hint} has no medoids; re-run pre_weights.py to rebuild weights "
+                "or pass --medoid_live_targets."
+            )
+        return target_kind
+
+    @property
+    def descriptor_dim(self) -> Optional[int]:
+        if self.centroids is not None:
+            return int(self.centroids.shape[1])
+        if self.place_sums is not None:
+            return int(self.place_sums.shape[1])
+        if self.medoids is not None:
+            return int(self.medoids.shape[1])
+        return None
+
+    @property
+    def medoid_path_by_place(self) -> Dict[int, str]:
+        return dict(self._medoid_path_by_place)
 
     def _label_indices(self, labels: torch.Tensor) -> torch.Tensor:
         labels_list = labels.view(-1).tolist()
@@ -383,6 +481,10 @@ class PlaceCentroidTable:
 
     def targets_excluding_query(self, z: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         """vMF target: remove the live query from the full-place offline aggregate."""
+        if self.place_sums is None:
+            raise ValueError(
+                "centroid LOO targets require place_sums; reload pre_weights without medoid mode"
+            )
         idx = self._label_indices(labels)
         sums = self.place_sums[idx].to(device=z.device, dtype=z.dtype)
         return F.normalize(sums - z, dim=-1)
@@ -391,7 +493,8 @@ class PlaceCentroidTable:
         """vMF target: precomputed place medoid (medoid images are excluded from training)."""
         if self.medoids is None:
             raise ValueError(
-                "pre_weights file has no medoids; re-run pre_weights.py to rebuild weights."
+                "pre_weights file has no medoids; re-run pre_weights.py to rebuild weights "
+                "or use --medoid_live_targets to re-encode medoid images each step."
             )
         idx = self._label_indices(labels)
         return self.medoids[idx].to(device=z.device, dtype=z.dtype)
@@ -458,7 +561,7 @@ def _debug_main() -> None:
     )
 
     if args.mode == "loo":
-        table = PlaceCentroidTable.from_file(Path(args.weights_in))
+        table = PlaceCentroidTable.from_file(Path(args.weights_in), load_all=True)
         cfg = load_config(Path(args.config))
         cfg.update({
             "device": args.device,
@@ -479,7 +582,7 @@ def _debug_main() -> None:
         ])
         dataset = _PlaceImageDataset(places_df, transform)
         loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
-        images, labels, _image_paths = next(iter(loader))
+        images, labels, _image_paths, _rows = next(iter(loader))
         with torch.no_grad():
             z = model(images.to(device))[0].cpu()
         targets = table.targets_excluding_query(z, labels)
@@ -499,13 +602,15 @@ def _debug_main() -> None:
     )
     _device, model = init_model(cfg)
     model = model.to(device)
-    place_ids, centroids, place_sums, counts, medoids, medoid_image_paths = compute_place_centroids(
+    place_ids, centroids, place_sums, counts, medoids, medoid_image_paths = (
+        compute_place_centroids(
         model,
         device,
         places_df,
         image_size=args.image_size,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        )
     )
     save_place_weights(
         Path(args.weights_out),

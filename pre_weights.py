@@ -62,6 +62,11 @@ def main() -> None:
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--csv_in", type=str, default=None, help="Reuse existing places CSV instead of rebuilding.")
     parser.add_argument("--max_places", type=int, default=0, help="Debug: keep only the first N places.")
+    parser.add_argument(
+        "--medoid_index_only",
+        action="store_true",
+        help="Save medoid image paths only (omit frozen medoid embedding tensor).",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -124,14 +129,19 @@ def main() -> None:
 
     device = torch.device("cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu")
     model = _load_encoder(cfg, device)
-    place_ids, centroids, place_sums, counts, medoids, medoid_image_paths = compute_place_centroids(
+    place_ids, centroids, place_sums, counts, medoids, medoid_image_paths = (
+        compute_place_centroids(
         model,
         device,
         places_df,
         image_size=args.image_size,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        )
     )
+    if args.medoid_index_only:
+        medoids = None
+        logger.info("medoid_index_only: saving medoid paths without frozen medoid embeddings")
     save_place_weights(
         Path(args.weights_out),
         place_ids,
@@ -148,6 +158,7 @@ def main() -> None:
             "train_cities": cities,
             "gsv_base_path": str(base_path),
             "sfxl_train_root": str(sfxl_root) if sfxl_root else None,
+            "medoid_index_only": bool(args.medoid_index_only),
         },
     )
 

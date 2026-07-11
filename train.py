@@ -1,9 +1,11 @@
 import logging
 import sys
 from pathlib import Path
+from typing import Optional
 
 import pytorch_lightning as pl
 import torch
+import torch.nn.functional as F
 import torch.multiprocessing as mp
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint, TQDMProgressBar
 from torch.optim import lr_scheduler
@@ -40,7 +42,12 @@ logger = logging.getLogger(__name__)
 class VPRModel(pl.LightningModule):
     """Lightning wrapper around MixVPR encoder from get_model (same path as eval)."""
 
-    def __init__(self, cfg, core: torch.nn.Module):
+    def __init__(
+        self,
+        cfg,
+        core: torch.nn.Module,
+        place_centroids: Optional[PlaceCentroidTable] = None,
+    ):
         super().__init__()
         self.freeze_base = bool(cfg.get("freeze_model"))
         self.freeze_batchnorm = bool(cfg.get("freeze_batchnorm"))
@@ -87,28 +94,17 @@ class VPRModel(pl.LightningModule):
         self._eval_cfg = cfg
         self._wandb_cb = None
         self._flat_batches = bool(cfg.get("mixvpr_random_images"))
-        self._place_centroids = None
         self._use_medoid_targets = bool(cfg.get("use_medoid_targets"))
+        self._medoid_live_targets = bool(cfg.get("medoid_live_targets"))
         if cfg.get("use_pre_weights"):
-            weights_path = Path(cfg["pre_weights_path"])
-            self._place_centroids = PlaceCentroidTable.from_file(weights_path)
-            target_kind = "medoid" if self._use_medoid_targets else "centroid"
-            logger.info(
-                "Loaded pre_weights from %s (%d places, dim=%d, target=%s)",
-                weights_path,
-                self._place_centroids.place_ids.numel(),
-                self._place_centroids.centroids.shape[1],
-                target_kind,
-            )
-            if self._use_medoid_targets and self._place_centroids.medoids is None:
+            if place_centroids is None:
                 raise ValueError(
-                    f"{weights_path} has no medoids; re-run pre_weights.py to rebuild weights."
+                    "use_pre_weights requires a shared PlaceCentroidTable "
+                    "(load once in train.py and pass to VPRModel)"
                 )
-            if self._use_medoid_targets and self._place_centroids.medoid_image_paths is None:
-                raise ValueError(
-                    f"{weights_path} has no medoid_image_paths; "
-                    "re-run pre_weights.py to rebuild weights."
-                )
+            self._place_centroids = place_centroids
+        else:
+            self._place_centroids = None
 
     def _set_train_mode(self) -> None:
         self.train()
@@ -209,12 +205,41 @@ class VPRModel(pl.LightningModule):
                 pg["lr"] = lr_scale * pg["initial_lr"]
         optimizer.step(closure=optimizer_closure)
 
-    def _uncertainty_loss(self, descriptors, labels, variances):
+    def _encode_medoid_tensors(self, images: torch.Tensor) -> torch.Tensor:
+        """Encode preloaded medoid images (from DataLoader workers)."""
+        descriptors, _variances = self(images)
+        return descriptors
+
+    def _live_medoid_targets(
+        self,
+        labels: torch.Tensor,
+        medoid_imgs: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """One medoid encode per unique place in the batch (P×K labels repeat each place K times)."""
+        if medoid_imgs is None:
+            raise RuntimeError(
+                "medoid_live_targets requires medoid images from the DataLoader "
+                "(P×K batch with medoid_transform). Check GSVCitiesDataset returns a 3-tuple."
+            )
+        medoid_imgs = medoid_imgs.to(self.device, non_blocking=True)
+        medoid_desc = self._encode_medoid_tensors(medoid_imgs)
+        k = labels.shape[0] // medoid_imgs.shape[0]
+        if k * medoid_imgs.shape[0] != labels.shape[0]:
+            raise ValueError(
+                f"medoid batch size {medoid_imgs.shape[0]} does not divide "
+                f"label count {labels.shape[0]}"
+            )
+        return medoid_desc.repeat_interleave(k, dim=0)
+
+    def _uncertainty_loss(self, descriptors, labels, variances, medoid_imgs=None):
         if self._use_kappa_ms:
             return self._kappa_ms_loss(descriptors, labels, variances)
         if self._place_centroids is not None:
             if self._use_medoid_targets:
-                targets = self._place_centroids.medoid_targets(descriptors, labels)
+                if self._medoid_live_targets:
+                    targets = self._live_medoid_targets(labels, medoid_imgs)
+                else:
+                    targets = self._place_centroids.medoid_targets(descriptors, labels)
             else:
                 # Offline: full-place aggregate (all images). Train: exclude this query.
                 targets = self._place_centroids.targets_excluding_query(descriptors, labels)
@@ -235,7 +260,7 @@ class VPRModel(pl.LightningModule):
             return_parts=return_parts,
         )
 
-    def loss_function(self, descriptors, labels, variances=None):
+    def loss_function(self, descriptors, labels, variances=None, medoid_imgs=None):
         loss = torch.tensor(0.0, device=descriptors.device, dtype=descriptors.dtype)
         batch_acc = 0.0
 
@@ -253,7 +278,9 @@ class VPRModel(pl.LightningModule):
             if self.loss_basic is not None:
                 loss = loss + self.loss_basic(descriptors, labels, miner_outputs)
             if self.loss_uncertainty is not None and variances is not None:
-                loss = loss + self._uncertainty_loss(descriptors, labels, variances)
+                loss = loss + self._uncertainty_loss(
+                    descriptors, labels, variances, medoid_imgs
+                )
             nb_samples = descriptors.shape[0]
             nb_mined = len(set(miner_outputs[0].detach().cpu().numpy()))
             batch_acc = 1.0 - (nb_mined / nb_samples)
@@ -265,23 +292,29 @@ class VPRModel(pl.LightningModule):
                 else:
                     loss = loss + basic_out
             if self.loss_uncertainty is not None and variances is not None:
-                loss = loss + self._uncertainty_loss(descriptors, labels, variances)
+                loss = loss + self._uncertainty_loss(
+                    descriptors, labels, variances, medoid_imgs
+                )
 
         if not self.freeze_base and (self.miner is not None or self.loss_basic is not None):
             self.batch_acc.append(batch_acc)
         return loss
 
     def training_step(self, batch, batch_idx):
+        medoid_imgs = None
         if self._flat_batches:
             images, labels = batch
         else:
-            places, labels = batch
+            if len(batch) == 3:
+                places, labels, medoid_imgs = batch
+            else:
+                places, labels = batch
             bs, n, ch, h, w = places.shape
             images = places.view(bs * n, ch, h, w)
             labels = labels.view(-1)
 
         descriptors, variances = self(images)
-        loss = self.loss_function(descriptors, labels, variances)
+        loss = self.loss_function(descriptors, labels, variances, medoid_imgs)
 
         if variances is not None:
             per_sample = variances.detach().float().mean(dim=-1).cpu()
@@ -419,15 +452,41 @@ if __name__ == "__main__":
 
     device, core = init_model(cfg)
 
-    img_side = int(cfg["image_size"])
+    img_size = int(cfg["image_size"])
     train_cities = cfg.get("train_cities") or TRAIN_CITIES
+
+    place_centroids = None
+    if cfg.get("use_pre_weights"):
+        weights_path = Path(cfg["pre_weights_path"])
+        use_medoid_targets = bool(cfg.get("use_medoid_targets"))
+        medoid_live_targets = bool(cfg.get("medoid_live_targets"))
+        place_centroids = PlaceCentroidTable.from_file(
+            weights_path,
+            use_medoid_targets=use_medoid_targets,
+            medoid_live_targets=medoid_live_targets,
+        )
+        target_kind = place_centroids.validate_for_training(
+            use_medoid_targets=use_medoid_targets,
+            medoid_live_targets=medoid_live_targets,
+            path=weights_path,
+        )
+        dim = place_centroids.descriptor_dim
+        dim_str = str(dim) if dim is not None else "n/a"
+        logger.info(
+            "Pre_weights ready: %s (%d places, dim=%s, target=%s)",
+            weights_path,
+            place_centroids.place_ids.numel(),
+            dim_str,
+            target_kind,
+        )
+
     datamodule = GSVCitiesDataModule(
         batch_size=cfg["batch_size"],
         img_per_place=cfg["img_per_place"],
         min_img_per_place=cfg["min_img_per_place"],
         shuffle_all=bool(cfg["mixvpr_shuffle_all"]),
         random_sample_from_each_place=bool(cfg["mixvpr_random_sample_from_each_place"]),
-        image_size=(img_side, img_side),
+        image_size=(img_size, img_size),
         num_workers=cfg["num_workers"],
         show_data_stats=True,
         cities=train_cities,
@@ -439,7 +498,10 @@ if __name__ == "__main__":
         random_images=bool(cfg.get("mixvpr_random_images")),
         places_csv_path=cfg.get("places_csv_path"),
         pre_weights_path=cfg.get("pre_weights_path"),
+        place_centroids=place_centroids,
         use_medoid_targets=bool(cfg.get("use_medoid_targets")),
+        medoid_live_targets=bool(cfg.get("medoid_live_targets")),
+        max_train_places=int(cfg.get("max_train_places") or 0),
     )
 
     callbacks = [
@@ -447,7 +509,7 @@ if __name__ == "__main__":
     ]
     wandb_cb = attach_wandb_callback(cfg, callbacks)
 
-    model = VPRModel(cfg, core=core)
+    model = VPRModel(cfg, core=core, place_centroids=place_centroids)
     if wandb_cb is not None:
         model._wandb_cb = wandb_cb
     # attach_val_ece_callback(cfg, callbacks)  # old: duplicate FAISS for ECE only

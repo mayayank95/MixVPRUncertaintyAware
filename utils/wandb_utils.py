@@ -60,9 +60,14 @@ def _default_wandb_run_name(args: Dict[str, Any], job_type: str) -> str:
 
     # var_head (only if uncertainty mode is enabled)
     if args.get("model_mode") == "uncertainty":
-        agg = bool(args.get("var_head_agg", False))
+        head_type = str(args.get("var_head_type", "descriptor")).lower()
         lin = str(args.get("var_head_linear", "d")).lower()
-        parts.append(f"{'agg' if agg else 'noagg'}-lin{lin}")
+        if head_type == "gem":
+            parts.append("gem-lin1")
+        elif head_type == "agg":
+            parts.append(f"agg-lin{lin}")
+        else:
+            parts.append(f"noagg-lin{lin}")
 
     # Loss tags: "ce" if cross-entropy is active; uncertainty loss type if uncertainty is active
     if "ce" in loss_tokens:

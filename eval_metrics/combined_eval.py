@@ -51,13 +51,19 @@ def _is_amstertime(shard: Dict[str, Any]) -> bool:
     return "amstertime" in _shard_base_name(shard)
 
 
-def _matches_core_four(shard: Dict[str, Any]) -> bool:
-    """all sf-xl shards, msls-val query, pitts30k."""
+def _matches_core_seven(shard: Dict[str, Any]) -> bool:
+    """all sf-xl + msls-val(query) + pitts30k + amstertime (former combined_6)."""
+    return (
+        _is_sf_xl(shard)
+        or _is_pitts30(shard)
+        or _is_msls_query(shard)
+        or _is_amstertime(shard)
+    )
+
+
+def _matches_core_six(shard: Dict[str, Any]) -> bool:
+    """all sf-xl + msls-val(query) + pitts30k (former combined_5; no amstertime)."""
     return _is_sf_xl(shard) or _is_pitts30(shard) or _is_msls_query(shard)
-
-
-def _matches_core_five(shard: Dict[str, Any]) -> bool:
-    return _matches_core_four(shard) or _is_amstertime(shard)
 
 
 def _merge_ece_variant(panel: Dict[str, Any], variant: str, ece_result: Dict[str, Any]) -> None:
@@ -475,15 +481,15 @@ def _filter_shards_no_amstertime(agg_list: List[Dict[str, Any]]) -> List[Dict[st
     return [d for d in agg_list if not _is_amstertime(d)]
 
 
-def _filter_shards_core_five(agg_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [d for d in agg_list if _matches_core_five(d)]
+def _filter_shards_core_seven(agg_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [d for d in agg_list if _matches_core_seven(d)]
 
 
-def _filter_shards_core_four(agg_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [d for d in agg_list if _matches_core_four(d)]
+def _filter_shards_core_six(agg_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [d for d in agg_list if _matches_core_six(d)]
 
 
-def _has_core_four_requirements(shards: List[Dict[str, Any]]) -> bool:
+def _has_core_six_requirements(shards: List[Dict[str, Any]]) -> bool:
     """Require at least one sf-xl shard, msls(query), and pitts30k shard."""
     return (
         any(_is_sf_xl(s) for s in shards)
@@ -492,9 +498,9 @@ def _has_core_four_requirements(shards: List[Dict[str, Any]]) -> bool:
     )
 
 
-def _has_core_five_requirements(shards: List[Dict[str, Any]]) -> bool:
-    """Core four requirements plus at least one amstertime shard."""
-    return _has_core_four_requirements(shards) and any(_is_amstertime(s) for s in shards)
+def _has_core_seven_requirements(shards: List[Dict[str, Any]]) -> bool:
+    """Require sf-xl, msls(query), pitts30k, and amstertime."""
+    return _has_core_six_requirements(shards) and any(_is_amstertime(s) for s in shards)
 
 
 # Each view pools the same shard set for kappa, baselines (l2/pa/sue/sue_log), and vMF extras.
@@ -516,34 +522,34 @@ _COMBINED_VIEWS = (
         "exact_shards": None,
     },
     {
+        "output_subdir": "combined_7",
+        "plot_prefix": "ece_combined_7",
+        "wandb_prefix": "Eval_combined_7",
+        "description": "all sf-xl shards + msls-val(query) + pitts30k + amstertime",
+        "filter_fn": _filter_shards_core_seven,
+        "exact_shards": None,
+        "required_predicate": _has_core_seven_requirements,
+    },
+    {
         "output_subdir": "combined_6",
         "plot_prefix": "ece_combined_6",
         "wandb_prefix": "Eval_combined_6",
-        "description": "all sf-xl shards, msls-val query, pitts30k, amstertime",
-        "filter_fn": _filter_shards_core_five,
+        "description": "all sf-xl shards + msls-val(query) + pitts30k",
+        "filter_fn": _filter_shards_core_six,
         "exact_shards": None,
-        "required_predicate": _has_core_five_requirements,
-    },
-    {
-        "output_subdir": "combined_5",
-        "plot_prefix": "ece_combined_5",
-        "wandb_prefix": "Eval_combined_5",
-        "description": "all sf-xl shards, msls-val query, pitts30k",
-        "filter_fn": _filter_shards_core_four,
-        "exact_shards": None,
-        "required_predicate": _has_core_four_requirements,
+        "required_predicate": _has_core_six_requirements,
     },
 )
 
 
 def run_combined_ece_variants(cfg, all_panel_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Run four combined views; every metric uses the same shards within each view.
+    """Run combined views; every metric uses the same shards within each view.
 
     Views:
       1. combined_all — all evaluated shards
       2. combined_all_no_amst — same, minus amstertime
-      3. combined_6 — all sf-xl shards + msls-val(query) + pitts30k + amstertime
-      4. combined_5 — all sf-xl shards + msls-val(query) + pitts30k
+      3. combined_7 — all sf-xl shards + msls-val(query) + pitts30k + amstertime
+      4. combined_6 — all sf-xl shards + msls-val(query) + pitts30k
     """
     combined_outputs: List[Dict[str, Any]] = []
     agg_list = _combined_shards_from_panels(all_panel_data)

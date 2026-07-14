@@ -5,8 +5,10 @@ import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
 
-from models.layers import L2Norm
+from models.layers import Flatten, GeM, L2Norm
 from models.mixvpr import MixVPRModel, mixvpr_agg_config
+
+MIXVPR_BACKBONE_CHANNELS = 1024
 
 
 class GeneralModelWrapper(nn.Module):
@@ -33,10 +35,9 @@ def _stable_var_init(module, activation="softplus", target_variance=0.1):
                 nn.init.constant_(m.bias, bias_val)
 
 
-def _make_var_head_cls(use_agg: bool, linear_kind: str, act_name: str):
+def _make_var_head_cls(tag: str, linear_kind: str, act_name: str):
     """Subclass with a descriptive __name__ for Lightning model summaries."""
-    agg_tag = "agg" if use_agg else "noagg"
-    type_name = f"VarHead({agg_tag}, lin={linear_kind}, {act_name})"
+    type_name = f"VarHead({tag}, lin={linear_kind}, {act_name})"
 
     class VarHead(nn.Module):
         def __init__(self, layers):
@@ -51,17 +52,46 @@ def _make_var_head_cls(use_agg: bool, linear_kind: str, act_name: str):
     return VarHead
 
 
+def _build_gem_aggregation(in_channels: int, fc_output_dim: int) -> nn.Sequential:
+    """CosPlace-style GeM aggregation (same block as KappaPlace/CosPlace GeoLocalizationNet)."""
+    return nn.Sequential(
+        L2Norm(),
+        GeM(),
+        Flatten(),
+        nn.Linear(in_channels, fc_output_dim),
+    )
+
+
+def _resolve_var_head_type(opt) -> str:
+    """Map CLI/config flags to a variance head type."""
+    explicit = str(opt.get("var_head_type", "")).lower()
+    if explicit in ("descriptor", "agg", "gem"):
+        return explicit
+    if opt.get("var_head_agg"):
+        return "agg"
+    return "descriptor"
+
+
 def _build_var_head(opt, fc_output_dim, aggregation=None):
-    """Build the variance head from orthogonal flags."""
-    use_agg = bool(opt.get("var_head_agg", False))
+    """Build the variance head from orthogonal flags (type × linear × activation)."""
+    head_type = _resolve_var_head_type(opt)
     linear_kind = str(opt.get("var_head_linear", "d")).lower()
     act_name = opt.get("variance_activation", "softplus") or "softplus"
     activation = nn.Sigmoid() if act_name == "sigmoid" else nn.Softplus()
 
     layers = []
-    if use_agg:
+    if head_type == "gem":
+        layers.append(_build_gem_aggregation(MIXVPR_BACKBONE_CHANNELS, fc_output_dim))
+        tag = "gem_agg"
+        from_feature_map = True
+    elif head_type == "agg":
         assert aggregation is not None, "var_head_agg=True requires the aggregation module"
         layers.append(copy.deepcopy(aggregation))
+        tag = "agg"
+        from_feature_map = True
+    else:
+        tag = "noagg"
+        from_feature_map = False
 
     if linear_kind == "d":
         layers.append(nn.Linear(fc_output_dim, fc_output_dim))
@@ -73,12 +103,12 @@ def _build_var_head(opt, fc_output_dim, aggregation=None):
         )
 
     layers.append(activation)
-    head = _make_var_head_cls(use_agg, linear_kind, act_name)(layers)
+    head = _make_var_head_cls(tag, linear_kind, act_name)(layers)
 
     if opt.get("var_init"):
         _stable_var_init(head, act_name)
 
-    return head, use_agg
+    return head, from_feature_map
 
 
 class MixVPREncoder(MixVPRModel):

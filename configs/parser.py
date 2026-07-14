@@ -296,6 +296,9 @@ def parse_args() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
     p.add_argument("--var_head_agg", action="store_true",
         help="Prepend a deep-copy of the aggregation module to the variance head "
         "(operates on the backbone feature map instead of the descriptor).")
+    p.add_argument("--var_head_type", type=str, default=None, choices=["descriptor", "agg", "gem"],
+        help="Uncertainty head input path: descriptor (on μ), agg (aggregator copy on "
+        "backbone map), or gem (CosPlace GeM agg on backbone map, KappaPlace-style). ")
     p.add_argument("--var_head_linear", type=str, default="1", choices=["none", "d", "1"],
         help="Linear layer in the variance head: 'none' (no Linear), "
         "'d' (Linear(fc_output_dim, fc_output_dim)), or '1' (Linear(fc_output_dim, 1)).")
@@ -536,7 +539,13 @@ def normalize(merged: Dict[str, Any]) -> Dict[str, Any]:
         if out.get("model_mode") != "uncertainty":
             raise ValueError("uncertainty_loss=kappa_ms requires model_mode=uncertainty")
 
-    out["var_head_agg"] = bool(out.get("var_head_agg", False))
+    if str(out.get("var_head_type", "")).lower() in ("descriptor", "agg", "gem"):
+        out["var_head_type"] = str(out["var_head_type"]).lower()
+    elif out.get("var_head_agg"):
+        out["var_head_type"] = "agg"
+    else:
+        out["var_head_type"] = "descriptor"
+    out["var_head_agg"] = out["var_head_type"] == "agg"
     out["var_head_linear"] = str(out.get("var_head_linear", "d")).lower()
     out["ece_two_sided"] = bool(out.get("ece_two_sided", False))
 

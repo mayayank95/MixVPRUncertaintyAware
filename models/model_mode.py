@@ -7,6 +7,7 @@ import torchvision.transforms as transforms
 
 from models.layers import Flatten, GeM, L2Norm
 from models.mixvpr import MixVPRModel, mixvpr_agg_config
+from models.salad import SaladEncoder
 
 MIXVPR_BACKBONE_CHANNELS = 1024
 
@@ -72,6 +73,19 @@ def _resolve_var_head_type(opt) -> str:
     return "descriptor"
 
 
+def _disable_dropout(module: nn.Module) -> None:
+    """Replace Dropout with Identity so train/eval κ is deterministic.
+
+    Used on the var_head aggregator copy only. MixVPR has no dropout; SALAD's
+    0.3 dropout stays on the frozen descriptor aggregator.
+    """
+    for name, child in list(module.named_children()):
+        if isinstance(child, nn.Dropout):
+            setattr(module, name, nn.Identity())
+        else:
+            _disable_dropout(child)
+
+
 def _build_var_head(opt, fc_output_dim, aggregation=None):
     """Build the variance head from orthogonal flags (type × linear × activation)."""
     head_type = _resolve_var_head_type(opt)
@@ -86,7 +100,9 @@ def _build_var_head(opt, fc_output_dim, aggregation=None):
         from_feature_map = True
     elif head_type == "agg":
         assert aggregation is not None, "var_head_agg=True requires the aggregation module"
-        layers.append(copy.deepcopy(aggregation))
+        agg_copy = copy.deepcopy(aggregation)
+        _disable_dropout(agg_copy)
+        layers.append(agg_copy)
         tag = "agg"
         from_feature_map = True
     else:
@@ -124,6 +140,7 @@ class MixVPREncoder(MixVPRModel):
 
 _METHOD_ENCODERS = {
     "mixvpr": MixVPREncoder,
+    "salad": SaladEncoder,
 }
 
 
@@ -140,6 +157,7 @@ def _attach_encoder(model, encoder):
     for name, module in encoder.named_children():
         setattr(model, name, module)
     model._uses_mixvpr = isinstance(encoder, MixVPREncoder)
+    model._encoder_kind = type(encoder).__name__
     model._aggregation_module = encoder.aggregation_module
     model._freeze_base = encoder.freeze_base
     return encoder
@@ -147,11 +165,9 @@ def _attach_encoder(model, encoder):
 
 def _encode_inputs(model, inputs):
     if model._uses_mixvpr:
-        x = transforms.Resize([320, 320], antialias=True)(inputs)
-        feat = model.backbone(x)
-        return feat, model.aggregator(feat)
+        inputs = transforms.Resize([320, 320], antialias=True)(inputs)
     feat = model.backbone(inputs)
-    return feat, model.aggregation(feat)
+    return feat, model.aggregator(feat)
 
 
 class Basic(nn.Module):

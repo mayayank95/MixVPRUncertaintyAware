@@ -46,7 +46,7 @@ def get_model(args: Dict[str, Any]) -> torch.nn.Module:
     """Build model and optionally load pretrained weights."""
     method = args["method"]
 
-    if method in ("cosplace", "mixvpr"):
+    if method in ("cosplace", "mixvpr", "salad"):
         model = build_model_mode(args)
     elif method == "cosplace_pretrained":
         logger.info(

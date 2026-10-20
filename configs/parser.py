@@ -163,10 +163,11 @@ def parse_args() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
         help="Random image subset per place each epoch",
     )
     p.add_argument(
-        "--gsv_base_path",
+        "--places_root",
         type=str,
         default="/home/shared/datasets/gsv_cities/",
-        help="GSV-style dataset root (Dataframes/ + optional Images/). Use sfxl_gsv output for SF-XL.",
+        help="Root with Dataframes/{city}.csv and optional Images/. "
+        "GSV-Cities: gsv_cities/; SF-XL: SF-XL (processed tables).",
     )
     p.add_argument(
         "--sfxl_train_root",
@@ -404,7 +405,7 @@ def normalize(merged: Dict[str, Any]) -> Dict[str, Any]:
 
     # Paths: store as strings in config, but normalize to expanded string paths
     for k in ("data_folder", "logs_folder", "resume_train", "resume_model",
-              "gsv_base_path", "sfxl_train_root"):
+              "places_root", "sfxl_train_root"):
         if k in out and out[k] is not None:
             out[k] = str(Path(out[k]).expanduser())
 

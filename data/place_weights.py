@@ -526,7 +526,11 @@ def _debug_main() -> None:
     )
     parser.add_argument("--config", default="configs/datasets.json")
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--gsv_base_path", default="/home/shared/datasets/gsv_cities/")
+    parser.add_argument(
+        "--places_root",
+        default="/home/shared/datasets/gsv_cities/",
+        help="Root with Dataframes/{city}.csv.",
+    )
     parser.add_argument("--csv_in", default="cache/gsv_preweights/places_all.csv")
     parser.add_argument("--csv_out", default="cache/gsv_preweights/places_debug.csv")
     parser.add_argument("--weights_in", default="cache/gsv_preweights/centroids_128_min16.pt")
@@ -545,7 +549,7 @@ def _debug_main() -> None:
     if args.mode == "index":
         places_df = build_places_index(
             cities=[args.city],
-            base_path=Path(args.gsv_base_path),
+            base_path=Path(args.places_root),
             min_img_per_place=args.min_img_per_place,
         )
         places_df = _subset_places_df(places_df, args.max_places)

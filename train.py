@@ -498,7 +498,7 @@ if __name__ == "__main__":
         val_set_names=list(cfg["mixvpr_val_sets"]),
         datasets_config=cfg["config"],
         positive_dist_threshold=cfg["positive_dist_threshold"],
-        base_path=cfg.get("gsv_base_path"),
+        base_path=cfg.get("places_root"),
         sfxl_train_root=cfg.get("sfxl_train_root"),
         random_images=bool(cfg.get("mixvpr_random_images")),
         places_csv_path=cfg.get("places_csv_path"),

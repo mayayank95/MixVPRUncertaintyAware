@@ -53,7 +53,12 @@ def main() -> None:
     parser.add_argument("--ckpt_state_dict_key", type=str, default="state_dict")
     parser.add_argument("--image_size", type=int, default=320)
     parser.add_argument("--train_cities", type=str, default=None)
-    parser.add_argument("--gsv_base_path", type=str, default="/home/shared/datasets/gsv_cities/")
+    parser.add_argument(
+        "--places_root",
+        type=str,
+        default="/home/shared/datasets/gsv_cities/",
+        help="Root with Dataframes/{city}.csv.",
+    )
     parser.add_argument("--sfxl_train_root", type=str, default=None)
     parser.add_argument("--min_img_per_place", type=int, default=4)
     parser.add_argument("--csv_out", type=str, default=None, help="Output CSV (one row per image).")
@@ -81,7 +86,7 @@ def main() -> None:
         "resume_model": args.resume_model,
         "ckpt_state_dict_key": args.ckpt_state_dict_key,
         "image_size": args.image_size,
-        "gsv_base_path": args.gsv_base_path,
+        "places_root": args.places_root,
         "sfxl_train_root": args.sfxl_train_root,
         "min_img_per_place": args.min_img_per_place,
     })
@@ -90,7 +95,7 @@ def main() -> None:
         parser.error("Provide --csv_out to build the index, or --csv_in to reuse an existing CSV.")
 
     cities = _parse_cities(args.train_cities)
-    base_path = Path(args.gsv_base_path)
+    base_path = Path(args.places_root)
     sfxl_root = Path(args.sfxl_train_root) if args.sfxl_train_root else None
     csv_out = Path(args.csv_out) if args.csv_out else Path(args.csv_in)
 
@@ -156,7 +161,7 @@ def main() -> None:
             "descriptors_dimension": args.descriptors_dimension,
             "resume_model": args.resume_model,
             "train_cities": cities,
-            "gsv_base_path": str(base_path),
+            "places_root": str(base_path),
             "sfxl_train_root": str(sfxl_root) if sfxl_root else None,
             "medoid_index_only": bool(args.medoid_index_only),
         },

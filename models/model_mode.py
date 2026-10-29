@@ -164,10 +164,20 @@ def _attach_encoder(model, encoder):
 
 
 def _encode_inputs(model, inputs):
+    """One backbone pass. Returns features, retrieval descriptor, descriptor-head input.
+
+    SALAD's retrieval descriptor is intra-normalized, so its length is constant.
+    The descriptor head reads the pre-L2 token and cluster sum (same width).
+    Other methods use the retrieval descriptor for that head as well.
+    """
     if model._uses_mixvpr:
         inputs = transforms.Resize([320, 320], antialias=True)(inputs)
     feat = model.backbone(inputs)
-    return feat, model.aggregator(feat)
+    if getattr(model, "_encoder_kind", None) == "SaladEncoder":
+        desc, prenorm = model.aggregator.aggregate(feat)
+        return feat, desc, prenorm
+    desc = model.aggregator(feat)
+    return feat, desc, desc
 
 
 class Basic(nn.Module):
@@ -183,7 +193,7 @@ class Basic(nn.Module):
         return self._freeze_base()
 
     def forward(self, inputs):
-        _, desc = _encode_inputs(self, inputs)
+        _, desc, _ = _encode_inputs(self, inputs)
         mu = self.final_l2(desc)
         return mu, torch.zeros_like(mu)
 
@@ -205,12 +215,12 @@ class Uncertainty(nn.Module):
         return self._freeze_base()
 
     def forward(self, inputs):
-        feat, desc = _encode_inputs(self, inputs)
+        feat, desc, head_in = _encode_inputs(self, inputs)
         mu = self.final_l2(desc)
         if self._var_from_feature_map:
             variance = self.var_head(feat)
         else:
-            variance = self.var_head(desc)
+            variance = self.var_head(head_in)
         return mu, variance + 1e-6
 
 

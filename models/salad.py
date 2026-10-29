@@ -121,15 +121,16 @@ class SALAD(nn.Module):
         )
         self.dust_bin = nn.Parameter(torch.tensor(1.0))
 
-    def forward(self, x):
+    def aggregate(self, x):
         """
-        x (tuple): A tuple containing two elements, features and token.
-            (torch.Tensor): The feature tensors (t_i) [B, C, H // 14, W // 14].
-            (torch.Tensor): The token tensor (t_{n+1}) [B, C].
+        x (tuple): features [B, C, H // 14, W // 14] and token [B, C].
 
         Returns:
-            (torch.Tensor): The global descriptor [B, m*l + g], before the final L2.
-            The retrieval model applies that L2, same as MixVPR's final_l2.
+            desc: intra-normalized descriptor [B, m*l + g]. Retrieval applies
+            the outer L2 on this, same as MixVPR's final_l2.
+            prenorm: same layout before those two L2s. Cluster-column norms
+            still carry Sinkhorn mass and feature agreement, which the kappa
+            head reads. ``forward`` returns only ``desc``.
         """
         features, token = x
         cluster = self.cluster_features(features).flatten(2)
@@ -139,13 +140,20 @@ class SALAD(nn.Module):
         scores = scores[:, :-1, :]
         scores = scores.unsqueeze(1).repeat(1, self.cluster_dim, 1, 1)
         cluster = cluster.unsqueeze(2).repeat(1, 1, self.num_clusters, 1)
-        return torch.cat(
+        aggregated = (cluster * scores).sum(dim=-1)
+        desc = torch.cat(
             [
                 nn.functional.normalize(token, p=2, dim=-1),
-                nn.functional.normalize((cluster * scores).sum(dim=-1), p=2, dim=1).flatten(1),
+                nn.functional.normalize(aggregated, p=2, dim=1).flatten(1),
             ],
             dim=-1,
         )
+        prenorm = torch.cat([token, aggregated.flatten(1)], dim=-1)
+        return desc, prenorm
+
+    def forward(self, x):
+        desc, _prenorm = self.aggregate(x)
+        return desc
 
 
 class SaladEncoder(nn.Module):

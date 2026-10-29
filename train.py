@@ -91,6 +91,7 @@ class VPRModel(pl.LightningModule):
             self.add_module(name, child)
         self._var_from_feature_map = getattr(core, "_var_from_feature_map", False)
         self._uses_mixvpr = core._uses_mixvpr
+        self._encoder_kind = core._encoder_kind
         self._eval_cfg = cfg
         self._wandb_cb = None
         self._flat_batches = bool(cfg.get("mixvpr_random_images"))
@@ -127,14 +128,14 @@ class VPRModel(pl.LightningModule):
             logger.info("BatchNorm2d layers frozen (freeze_batchnorm)")
 
     def forward(self, x):
-        feat, desc = _encode_inputs(self, x)
+        feat, desc, head_in = _encode_inputs(self, x)
         mu = self.final_l2(desc)
         if not hasattr(self, "var_head"):
             return mu, torch.zeros_like(mu)
         if self._var_from_feature_map:
             variance = self.var_head(feat)
         else:
-            variance = self.var_head(desc)
+            variance = self.var_head(head_in)
         return mu, variance + 1e-6
 
     def _uses_split_head_lr(self) -> bool:

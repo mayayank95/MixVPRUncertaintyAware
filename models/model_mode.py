@@ -101,6 +101,9 @@ def _build_var_head(opt, fc_output_dim, aggregation=None):
     elif head_type == "agg":
         assert aggregation is not None, "var_head_agg=True requires the aggregation module"
         agg_copy = copy.deepcopy(aggregation)
+        if str(opt.get("method", "")).lower() == "salad":
+            # This copy's forward returns prenorm. Retrieval keeps return_prenorm False.
+            agg_copy.return_prenorm = True
         _disable_dropout(agg_copy)
         layers.append(agg_copy)
         tag = "agg"

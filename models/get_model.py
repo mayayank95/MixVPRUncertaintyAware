@@ -26,6 +26,7 @@ def _load_weights(
         state_dict = checkpoint
     if any(k.startswith("core.") for k in state_dict):
         state_dict = {k[len("core.") :]: v for k, v in state_dict.items() if k.startswith("core.")}
+    checkpoint_keys = set(state_dict)
     if skip_var_head:
         n_before = len(state_dict)
         state_dict = {k: v for k, v in state_dict.items() if "var_head" not in k}
@@ -40,6 +41,53 @@ def _load_weights(
         logger.debug("State dict missing keys (left at default init): %s", missing)
     if unexpected:
         logger.debug("State dict unexpected keys (ignored): %s", unexpected)
+    return checkpoint_keys
+
+
+_AGG_HEAD_PREFIX = "var_head.seq.0."
+
+
+def _agg_init_mode(args: Dict[str, Any]) -> str:
+    """How the trainable kappa aggregator starts under ``--var_head_type agg``.
+
+    ``copy`` starts it from the loaded retrieval aggregator. ``random`` leaves
+    the weights it had when the model was built. Same choice for SALAD and MixVPR.
+    """
+    mode = str(args.get("var_head_agg_init") or "copy").lower()
+    if mode not in ("copy", "random"):
+        raise ValueError(
+            f"Unknown var_head_agg_init: {mode!r}. Expected 'copy' or 'random'."
+        )
+    return mode
+
+
+def _checkpoint_has_agg_head(checkpoint_keys) -> bool:
+    return any(key.startswith(_AGG_HEAD_PREFIX) for key in checkpoint_keys)
+
+
+def _copy_agg_if_missing(model: torch.nn.Module, args: Dict[str, Any], checkpoint_keys) -> None:
+    """Seed the κ aggregator from the loaded retrieval aggregator when requested.
+
+    The copy is built before ``--resume_model`` loads. ``copy`` fills it from the
+    retrieval aggregator when the checkpoint has no agg-head weights. ``random``
+    leaves that build-time init. A checkpoint that already stores the head keeps
+    those weights either way.
+    """
+    method = str(args.get("method", "")).lower()
+    if method not in ("salad", "mixvpr"):
+        return
+    if str(args.get("var_head_type", "")).lower() != "agg":
+        return
+    if _checkpoint_has_agg_head(checkpoint_keys):
+        logger.info("Checkpoint already contains the agg head; leaving those weights as loaded.")
+        return
+    mode = _agg_init_mode(args)
+    if mode == "random":
+        logger.info("Agg head keeps its build-time initialization (var_head_agg_init=random).")
+        return
+    root = getattr(model, "module", model)
+    root.var_head.seq[0].load_state_dict(root.aggregator.state_dict())
+    logger.info("Copied model.aggregator weights into %s (checkpoint had none).", _AGG_HEAD_PREFIX)
 
 
 def get_model(args: Dict[str, Any]) -> torch.nn.Module:
@@ -73,13 +121,16 @@ def get_model(args: Dict[str, Any]) -> torch.nn.Module:
     if resume_path is not None:
         skip_var_head = bool(args.get("var_init"))
         state_dict_key = args.get("ckpt_state_dict_key", "model_state_dict")
-        _load_weights(model, resume_path, state_dict_key=state_dict_key, skip_var_head=skip_var_head)
+        checkpoint_keys = _load_weights(
+            model, resume_path, state_dict_key=state_dict_key, skip_var_head=skip_var_head
+        )
         if skip_var_head:
             root = getattr(model, "module", model)
             if hasattr(root, "var_head"):
                 act = args.get("variance_activation", "softplus") or "softplus"
                 _stable_var_init(root.var_head, act)
                 logger.info("Variance head re-initialized (var_init) for stable start ~0.1.")
+        _copy_agg_if_missing(model, args, checkpoint_keys)
     elif method not in ("cosplace_pretrained", "mixvpr"):
         logger.info("No --resume_model provided. Model uses default weights (ImageNet).")
 

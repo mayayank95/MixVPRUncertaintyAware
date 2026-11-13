@@ -95,12 +95,16 @@ class SALAD(nn.Module):
         cluster_dim=128,
         token_dim=256,
         dropout=0.3,
+        return_prenorm=False,
     ) -> None:
         super().__init__()
         self.num_channels = num_channels
         self.num_clusters = num_clusters
         self.cluster_dim = cluster_dim
         self.token_dim = token_dim
+        # The agg head sets this on its private copy. Retrieval stays False and
+        # returns the intra-normalized descriptor.
+        self.return_prenorm = bool(return_prenorm)
         dropout_layer = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         self.token_features = nn.Sequential(
             nn.Linear(self.num_channels, 512),
@@ -130,7 +134,8 @@ class SALAD(nn.Module):
             the outer L2 on this, same as MixVPR's final_l2.
             prenorm: same layout before those two L2s. Cluster-column norms
             still carry Sinkhorn mass and feature agreement, which the kappa
-            head reads. ``forward`` returns only ``desc``.
+            head reads. ``forward`` returns ``prenorm`` when ``return_prenorm``
+            is set, and ``desc`` otherwise.
         """
         features, token = x
         cluster = self.cluster_features(features).flatten(2)
@@ -152,7 +157,9 @@ class SALAD(nn.Module):
         return desc, prenorm
 
     def forward(self, x):
-        desc, _prenorm = self.aggregate(x)
+        desc, prenorm = self.aggregate(x)
+        if self.return_prenorm:
+            return prenorm
         return desc
 
 

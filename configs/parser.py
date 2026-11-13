@@ -300,6 +300,12 @@ def parse_args() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
     p.add_argument("--var_head_type", type=str, default=None, choices=["descriptor", "agg", "gem"],
         help="Uncertainty head input path: descriptor (on μ), agg (aggregator copy on "
         "backbone map), or gem (CosPlace GeM agg on backbone map, KappaPlace-style). ")
+    p.add_argument("--var_head_agg_init", type=str, default="copy", choices=["copy", "random"],
+        help="How the trainable kappa head starts when --var_head_type agg. The kappa head "
+        "is its own copy of the aggregator, then Linear and Softplus. Same choice for SALAD "
+        "and MixVPR, and only when the checkpoint has no saved kappa-head weights. "
+        "copy: start that kappa aggregator from the loaded retrieval aggregator. "
+        "random: start it from the weights it had when the model was built.")
     p.add_argument("--var_head_linear", type=str, default="1", choices=["none", "d", "1"],
         help="Linear layer in the variance head: 'none' (no Linear), "
         "'d' (Linear(fc_output_dim, fc_output_dim)), or '1' (Linear(fc_output_dim, 1)).")
